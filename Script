@@ -1,0 +1,716 @@
+--[[
+	WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
+]]
+
+-- 1. Cap FPS low to reduce processing memory overhead
+setfpscap(10)
+
+-- 2. Fully disable 3D Rendering (The biggest RAM saver)
+game:GetService("RunService"):Set3dRenderingEnabled(false)
+
+-- 3. Clear existing workspace textures, particle effects, and lighting data
+local lighting = game:GetService("Lighting")
+lighting.GlobalShadows = false
+lighting.FogEnd = 9e9
+
+for _, obj in pairs(game:GetDescendants()) do
+    if obj:IsA("BasePart") then
+        obj.Material = Enum.Material.SmoothPlastic
+        obj.Reflectance = 0
+    elseif obj:IsA("Texture") or obj:IsA("Decal") or obj:IsA("Shirt") or obj:IsA("Pants") then
+        obj:Destroy()
+    elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Sparkles") then
+        obj:Destroy()
+    elseif obj:IsA("Explosion") then
+        obj:Destroy()
+    end
+end
+
+-- 4. Aggressive In-Game Memory Trimmer
+task.spawn(function()
+    while task.wait(15) do -- Clean every 15 seconds instead of 30
+        -- Force garbage collection
+        gcinfo()
+        
+        -- Mute and stop workspace sounds to clear audio buffer
+        for _, sound in ipairs(game:GetDescendants()) do
+            if sound:IsA("Sound") then
+                sound:Stop()
+                sound.Volume = 0
+            end
+        end
+        
+        -- Clear local core GUI memory leaks where possible
+        local CoreGui = game:GetService("CoreGui")
+        if CoreGui:FindFirstChild("RobloxNetworkPauseNotification") then
+            CoreGui.RobloxNetworkPauseNotification:Destroy()
+        end
+    end
+end)
+
+-- Core Game Services & Variables
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local VirtualUser = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local rootPart = character:WaitForChild("HumanoidRootPart")
+local humanoid = character:WaitForChild("Humanoid")
+
+local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
+local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
+
+-- Configuration Constants
+local MAX_DIST = 1000 
+local TARGET_SPEED = 23 -- Default starting speed
+local RESET_DELAY = 5.0 
+local ROUND_START_DELAY = 1.5
+local TARGET_CANDIES = 117000
+
+-- Webhook URL state updated via Rayfield Input Box
+local DISCORD_WEBHOOK_URL = ""
+
+local enabled = false
+local afkActive = false
+local isLoaded = false
+local bagIsFull = false
+local isWaitingForCoins = false 
+local activeCoins = {} 
+local blacklistedCoins = {} 
+local currentTarget = nil
+local noCoinsStartTime = nil 
+local hasCollectedThisLife = false 
+local goalReachedNotified = false
+
+-- Rate Calculation Variables
+local lastCandySnapshot = 0
+local lastSnapshotTime = 0
+
+local linearVelocity = nil
+local velocityAttachment = nil
+local noclipConnection = nil 
+local heartbeatConnection = nil
+local coinAddedConnection = nil
+local coinRemovedConnection = nil
+local coinsStartedConnection = nil
+local coinCollectedConnection = nil
+local targetFinderThread = nil
+local characterAddedConnection = nil
+local webhookLoopThread = nil
+
+local characterParts = {}
+
+local function updateCharacterParts()
+    characterParts = {}
+    if not character then return end
+    for _, part in ipairs(character:GetChildren()) do
+        if part:IsA("BasePart") then
+            table.insert(characterParts, part)
+        end
+    end
+end
+
+local function restoreCollision()
+    for _, part in ipairs(characterParts) do
+        if part and part.Parent then
+            part.CanCollide = true
+        end
+    end
+end
+
+local function cleanupConnections()
+    if heartbeatConnection then heartbeatConnection:Disconnect() heartbeatConnection = nil end
+    if noclipConnection then noclipConnection:Disconnect() noclipConnection = nil end
+    if coinAddedConnection then coinAddedConnection:Disconnect() coinAddedConnection = nil end
+    if coinRemovedConnection then coinRemovedConnection:Disconnect() coinRemovedConnection = nil end
+    if coinsStartedConnection then coinsStartedConnection:Disconnect() coinsStartedConnection = nil end
+    if coinCollectedConnection then coinCollectedConnection:Disconnect() coinCollectedConnection = nil end
+end
+
+local function stopMovement()
+    if linearVelocity then
+        linearVelocity.VectorVelocity = Vector3.zero
+        linearVelocity.Enabled = false
+    end
+    if rootPart then
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+local function setupVelocity()
+    if not rootPart then return end
+    
+    velocityAttachment = rootPart:FindFirstChild("FarmAttachment")
+    if not velocityAttachment then
+        velocityAttachment = Instance.new("Attachment")
+        velocityAttachment.Name = "FarmAttachment"
+        velocityAttachment.Parent = rootPart
+    end
+
+    linearVelocity = rootPart:FindFirstChild("FarmLinearVelocity")
+    if not linearVelocity then
+        linearVelocity = Instance.new("LinearVelocity")
+        linearVelocity.Name = "FarmLinearVelocity"
+        linearVelocity.Attachment0 = velocityAttachment
+        linearVelocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+        linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+        linearVelocity.VectorVelocity = Vector3.zero
+        linearVelocity.Enabled = false
+        linearVelocity.ForceLimitMode = Enum.ForceLimitMode.PerAxis
+        linearVelocity.MaxAxesForce = Vector3.new(100000, 100000, 100000)
+        linearVelocity.Parent = rootPart
+    end
+end
+
+local function removeVelocity()
+    if linearVelocity then linearVelocity:Destroy() linearVelocity = nil end
+    if velocityAttachment then velocityAttachment:Destroy() velocityAttachment = nil end
+end
+
+local function startNoclip()
+    if noclipConnection then noclipConnection:Disconnect() end
+    updateCharacterParts()
+    
+    noclipConnection = RunService.Stepped:Connect(function()
+        if character and enabled and humanoid and humanoid.Health > 0 and not bagIsFull and not isWaitingForCoins then
+            for i = 1, #characterParts do
+                local part = characterParts[i]
+                if part and part.Parent and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end
+    end)
+    
+    if humanoid then
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
+    end
+end
+
+local function stopNoclip()
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
+    end
+    restoreCollision()
+end
+
+local function antiAfkLoop()
+    while afkActive and enabled do
+        task.wait(30)
+        if not afkActive or not enabled then break end
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end
+end
+
+local function isCoin(part)
+    if not part:IsA("BasePart") or blacklistedCoins[part] then return false end 
+    local name = part.Name:lower()
+    return name:find("coin") or name:find("cash") or name:find("money") or name:find("collect")
+end
+
+local function checkGuiBagFull()
+    local playerGui = player:FindFirstChild("PlayerGui")
+    if not playerGui then return false end
+    
+    for _, gui in ipairs(playerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Name ~= "AutoFarmUI" then
+            local container = gui:FindFirstChild("Container", true)
+            if container then
+                for _, frame in ipairs(container:GetChildren()) do
+                    if frame:IsA("Frame") and frame.Visible then
+                        local fullIcon = frame:FindFirstChild("FullBagIcon", true)
+                        local fullText = frame:FindFirstChild("Full", true)
+                        if (fullIcon and fullIcon.Visible) or (fullText and fullText.Visible) then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function trackCoin(part)
+    if isCoin(part) then
+        activeCoins[part] = true
+    end
+end
+
+local function untrackCoin(part)
+    activeCoins[part] = nil
+    if currentTarget == part then
+        currentTarget = nil
+    end
+end
+
+local function getCandyCountNum()
+    local success, result = pcall(function()
+        local text = player.PlayerGui.CrossPlatform.Halloween2026.MainEvent.Main.BattlePass.Title.Tokens.Container.TextLabel.Text
+        local cleanedText = text:gsub("[^%d]", "")
+        return tonumber(cleanedText)
+    end)
+    if success and result then
+        return result
+    end
+    return 0
+end
+
+local function formatTimeRemaining(hoursTotal)
+    if hoursTotal <= 0 then return "Target Reached!" end
+    
+    local days = math.floor(hoursTotal / 24)
+    local remainingHours = math.floor(hoursTotal % 24)
+    local minutes = math.floor((hoursTotal * 60) % 60)
+    
+    local parts = {}
+    if days > 0 then table.insert(parts, days .. "d") end
+    if remainingHours > 0 or days > 0 then table.insert(parts, remainingHours .. "h") end
+    table.insert(parts, minutes .. "m")
+    
+    return table.concat(parts, " ")
+end
+
+local function sendDiscordWebhook(statusTitle, statusMsg, isGoalReached)
+    if DISCORD_WEBHOOK_URL == "" then return end
+
+    local currentCandies = getCandyCountNum()
+    local currentTime = os.clock()
+    
+    local timeDiffSeconds = currentTime - lastSnapshotTime
+    local candyDiff = currentCandies - lastCandySnapshot
+    
+    local candiesPerHour = 0
+    if timeDiffSeconds > 0 and candyDiff > 0 then
+        candiesPerHour = math.floor((candyDiff / timeDiffSeconds) * 3600)
+    end
+    
+    local candiesNeeded = math.max(0, TARGET_CANDIES - currentCandies)
+    local estimatedTimeText = "Calculating..."
+    
+    if candiesNeeded <= 0 then
+        estimatedTimeText = "🎯 Goal Reached!"
+    elseif candiesPerHour > 0 then
+        local hoursLeft = candiesNeeded / candiesPerHour
+        estimatedTimeText = formatTimeRemaining(hoursLeft)
+    else
+        estimatedTimeText = "Waiting for data..."
+    end
+
+    local fields = {
+        {
+            ["name"] = "🍬 Current Candies",
+            ["value"] = string.format("%d / %d", currentCandies, TARGET_CANDIES),
+            ["inline"] = true
+        },
+        {
+            ["name"] = "🎯 Remaining",
+            ["value"] = string.format("%d Candies", candiesNeeded),
+            ["inline"] = true
+        },
+        {
+            ["name"] = "⚡ Farm Rate",
+            ["value"] = string.format("%d / hr", candiesPerHour),
+            ["inline"] = true
+        },
+        {
+            ["name"] = "⏳ Time to Goal (117k)",
+            ["value"] = estimatedTimeText,
+            ["inline"] = true
+        }
+    }
+
+    local data = {
+        ["embeds"] = {{
+            ["title"] = statusTitle or "🎒 AutoFarm Notification",
+            ["description"] = statusMsg or "Bot progress report.",
+            ["color"] = 5814783,
+            ["fields"] = fields,
+            ["timestamp"] = os.date("!%Y-%m-%dT%H:%M:%SZ")
+        }}
+    }
+
+    if isGoalReached then
+        data["content"] = "@everyone 🚨 **The bot has successfully reached the goal of 117,000 candies!** 🚨"
+    end
+
+    local encodedData = HttpService:JSONEncode(data)
+    
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    if req then
+        pcall(function()
+            req({
+                Url = DISCORD_WEBHOOK_URL,
+                Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = encodedData
+            })
+        end)
+    end
+    
+    lastCandySnapshot = currentCandies
+    lastSnapshotTime = currentTime
+end
+
+local function triggerBagFullReset()
+    if bagIsFull then return end
+    bagIsFull = true
+    stopMovement()
+    stopNoclip()
+    
+    local currentCandies = getCandyCountNum()
+    if currentCandies >= TARGET_CANDIES and not goalReachedNotified then
+        goalReachedNotified = true
+        task.spawn(function()
+            sendDiscordWebhook("🎉 Goal Reached!", "The bot has reached 117,000 candies!", true)
+        end)
+    else
+        task.spawn(function()
+            sendDiscordWebhook("🎒 Coin Bag Full!", "The coin bag is full and the bot has reset.", false)
+        end)
+    end
+    
+    task.wait(0.2)
+    if humanoid and humanoid.Health > 0 then
+        humanoid.Health = 0
+    end
+end
+
+local function startWebhookLoop()
+    if webhookLoopThread then task.cancel(webhookLoopThread) end
+    
+    webhookLoopThread = task.spawn(function()
+        lastCandySnapshot = getCandyCountNum()
+        lastSnapshotTime = os.clock()
+        
+        sendDiscordWebhook("🚀 Script Executed", "AutoFarm initialized! Calculating farm rate...", false)
+        
+        task.wait(60)
+        local currentCandies = getCandyCountNum()
+        if currentCandies >= TARGET_CANDIES and not goalReachedNotified then
+            goalReachedNotified = true
+            sendDiscordWebhook("🎉 Goal Reached!", "The bot has reached 117,000 candies!", true)
+        else
+            sendDiscordWebhook("📊 Initial Rate Calculated", "First rate assessment completed.", false)
+        end
+        
+        task.wait(540)
+        while true do
+            local totalCandies = getCandyCountNum()
+            if totalCandies >= TARGET_CANDIES and not goalReachedNotified then
+                goalReachedNotified = true
+                sendDiscordWebhook("🎉 Goal Reached!", "The bot has reached 117,000 candies!", true)
+            else
+                sendDiscordWebhook("🔄 10-Minute Progress Report", "Automated status update.", false)
+            end
+            task.wait(600)
+        end
+    end)
+end
+
+local function initCoinListeners()
+    activeCoins = {}
+    
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if isCoin(v) then
+            activeCoins[v] = true
+        end
+    end
+    
+    coinAddedConnection = Workspace.DescendantAdded:Connect(trackCoin)
+    coinRemovedConnection = Workspace.DescendantRemoving:Connect(untrackCoin)
+
+    if gameplayRemotes then
+        local coinsStartedRemote = gameplayRemotes:WaitForChild("CoinsStarted", 5)
+        local coinCollectedRemote = gameplayRemotes:WaitForChild("CoinCollected", 5)
+
+        if coinsStartedRemote then
+            coinsStartedConnection = coinsStartedRemote.OnClientEvent:Connect(function()
+                isWaitingForCoins = true
+                stopMovement()
+                currentTarget = nil
+                activeCoins = {}
+                blacklistedCoins = {}
+                noCoinsStartTime = nil
+                bagIsFull = false
+                
+                task.wait(ROUND_START_DELAY)
+                
+                for _, v in ipairs(Workspace:GetDescendants()) do
+                    if isCoin(v) then
+                        activeCoins[v] = true
+                    end
+                end
+                
+                isWaitingForCoins = false
+            end)
+        end
+
+        if coinCollectedRemote then
+            coinCollectedConnection = coinCollectedRemote.OnClientEvent:Connect(function(coinType, currentAmount, maxAmount)
+                local current = tonumber(currentAmount)
+                local max = tonumber(maxAmount)
+                
+                if current and max and current >= max then
+                    triggerBagFullReset()
+                end
+            end)
+        end
+    end
+end
+
+local function startTargetFinder()
+    if targetFinderThread then task.cancel(targetFinderThread) end
+    
+    targetFinderThread = task.spawn(function()
+        while isLoaded do
+            task.wait(0.1)
+            
+            local currentCandies = getCandyCountNum()
+            if currentCandies >= TARGET_CANDIES and not goalReachedNotified then
+                goalReachedNotified = true
+                task.spawn(function()
+                    sendDiscordWebhook("🎉 Goal Reached!", "The bot has reached 117,000 candies!", true)
+                end)
+            end
+            
+            if enabled and not bagIsFull and checkGuiBagFull() then
+                triggerBagFullReset()
+            end
+
+            if enabled and not bagIsFull and not isWaitingForCoins and rootPart then
+                local rootPos = rootPart.Position
+                local nearest = nil
+                local nearestDist = MAX_DIST + 1
+                
+                for coin, _ in pairs(activeCoins) do
+                    if coin and coin.Parent and not blacklistedCoins[coin] then
+                        local dist = (coin.Position - rootPos).Magnitude
+                        if dist < nearestDist then
+                            nearestDist = dist
+                            nearest = coin
+                        end
+                    else
+                        activeCoins[coin] = nil
+                    end
+                end
+                
+                if nearest and not nearest:FindFirstChild("CoinVisual") then
+                    activeCoins[nearest] = nil
+                    nearest = nil
+                end
+                
+                currentTarget = nearest
+            end
+        end
+    end)
+end
+
+local function startMovementEngine()
+    cleanupConnections()
+    setupVelocity()
+    initCoinListeners()
+    noCoinsStartTime = nil
+    
+    if enabled and not bagIsFull then startNoclip() end
+    
+    heartbeatConnection = RunService.Heartbeat:Connect(function()
+        if not enabled or bagIsFull or isWaitingForCoins or not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then 
+            stopMovement()
+            return 
+        end
+        
+        if currentTarget and currentTarget.Parent and not blacklistedCoins[currentTarget] then
+            noCoinsStartTime = nil
+            local targetPos = currentTarget.Position
+            local rootPos = rootPart.Position
+            local dist = (targetPos - rootPos).Magnitude
+            
+            if dist <= 1.2 then
+                rootPart.CFrame = CFrame.new(targetPos)
+                stopMovement()
+                
+                hasCollectedThisLife = true
+                blacklistedCoins[currentTarget] = true
+                activeCoins[currentTarget] = nil
+                currentTarget = nil
+            else
+                if linearVelocity then
+                    linearVelocity.Enabled = true
+                    linearVelocity.VectorVelocity = (targetPos - rootPos).Unit * TARGET_SPEED
+                end
+            end
+        else
+            stopMovement()
+            
+            if hasCollectedThisLife then
+                if not noCoinsStartTime then
+                    noCoinsStartTime = os.clock()
+                elseif os.clock() - noCoinsStartTime >= RESET_DELAY then
+                    noCoinsStartTime = nil 
+                    cleanupConnections()
+                    humanoid.Health = 0 
+                end
+            else
+                noCoinsStartTime = nil
+            end
+        end
+    end)
+end
+
+local function unloadScript()
+    isLoaded = false
+    enabled = false
+    afkActive = false
+    bagIsFull = false
+    isWaitingForCoins = false
+    
+    cleanupConnections()
+    stopNoclip()
+    removeVelocity()
+    
+    if targetFinderThread then
+        task.cancel(targetFinderThread)
+        targetFinderThread = nil
+    end
+    if webhookLoopThread then
+        task.cancel(webhookLoopThread)
+        webhookLoopThread = nil
+    end
+    if characterAddedConnection then
+        characterAddedConnection:Disconnect()
+        characterAddedConnection = nil
+    end
+    
+    activeCoins = {}
+    blacklistedCoins = {}
+    currentTarget = nil
+end
+
+local function loadScript()
+    if isLoaded then unloadScript() end
+    isLoaded = true
+    bagIsFull = false
+    isWaitingForCoins = false
+    
+    character = player.Character or player.CharacterAdded:Wait()
+    rootPart = character:WaitForChild("HumanoidRootPart")
+    humanoid = character:WaitForChild("Humanoid")
+    
+    blacklistedCoins = {}
+    noCoinsStartTime = nil
+    hasCollectedThisLife = false
+    
+    startTargetFinder()
+    startMovementEngine()
+    startWebhookLoop()
+    
+    if characterAddedConnection then characterAddedConnection:Disconnect() end
+    characterAddedConnection = player.CharacterAdded:Connect(function(newChar)
+        cleanupConnections()
+        removeVelocity()
+        
+        character = newChar
+        rootPart = character:WaitForChild("HumanoidRootPart")
+        humanoid = character:WaitForChild("Humanoid")
+        
+        blacklistedCoins = {} 
+        noCoinsStartTime = nil
+        hasCollectedThisLife = false 
+        bagIsFull = false
+        isWaitingForCoins = false
+        
+        task.wait(1.5)
+        if isLoaded and enabled then
+            startMovementEngine()
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- RAYFIELD UI INITIALIZATION (AMETHYST THEME)
+--------------------------------------------------------------------------------
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Window = Rayfield:CreateWindow({
+   Name = "MM2 Auto Farm",
+   Icon = 0,
+   LoadingTitle = "MM2 Interface Suite",
+   LoadingSubtitle = "by ChatGPT",
+   Theme = "Amethyst",
+   ToggleUIKeybind = "K",
+   DisableRayfieldPrompts = false,
+   DisableBuildWarnings = false,
+   ConfigurationSaving = {
+      Enabled = true,
+      FolderName = "MM2AutoFarm",
+      FileName = "AmethystConfig"
+   }
+})
+
+local Tab = Window:CreateTab("Main", "coins")
+
+Tab:CreateToggle({
+   Name = "Enable Auto Farm",
+   CurrentValue = false,
+   Flag = "AutoFarmToggle",
+   Callback = function(Value)
+      enabled = Value
+      if Value then
+          if not isLoaded then loadScript() end
+          startMovementEngine()
+          if afkActive then task.spawn(antiAfkLoop) end
+      else
+          stopMovement()
+          stopNoclip()
+          noCoinsStartTime = nil
+      end
+   end,
+})
+
+Tab:CreateToggle({
+   Name = "Enable Anti-AFK",
+   CurrentValue = false,
+   Flag = "AntiAfkToggle",
+   Callback = function(Value)
+      afkActive = Value
+      if Value and enabled then task.spawn(antiAfkLoop) end
+   end,
+})
+
+Tab:CreateSlider({
+   Name = "Farming Speed",
+   Range = {10, 50},
+   Increment = 1,
+   Suffix = " Speed (27 Recommended)",
+   CurrentValue = 23,
+   Flag = "SpeedSlider",
+   Callback = function(Value)
+      TARGET_SPEED = Value
+   end,
+})
+
+Tab:CreateInput({
+   Name = "Discord Webhook URL",
+   CurrentValue = "",
+   PlaceholderText = "Paste webhook URL here...",
+   RemoveTextAfterFocusLost = false,
+   Flag = "WebhookInput",
+   Callback = function(Text)
+      DISCORD_WEBHOOK_URL = Text
+   end,
+})
+
+Rayfield:LoadConfiguration()
+loadScript()
