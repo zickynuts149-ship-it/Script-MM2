@@ -1,33 +1,28 @@
 --[[
-	Server Share - HOST (with automatic trade)
+	Trade - HOST	Run this in the Roblox server you want to trade in, with the other person
+	also in that server running joiner.lua. Nothing joins anybody: both of you
+	are already here.
 
-	Run this in the Roblox server you want someone to join.
+	The other side of the trade is simply the other player in this server, so
+there is no handshake to wait for: whoever else is here is the target, and the
+    request goes out 5s after they appear.
 
-	What it does
-	  1. Publishes this server's PlaceId / JobId plus your own name to a tiny
-	     public relay (ntfy.sh), so joiner.lua can find and teleport here.
-	  2. Listens on a second topic ("<server topic>_players") where the joiner
-	     announces itself. That is how this script learns the joiner's username
-	     before the joiner has even finished loading in. It also answers the
-	     joiner's "is anybody hosting?" ping there, but only while it really is
-	     free to host, so a finished host cannot attract anyone.
-	  3. Watches the actual Players list until that username is really in this
-	     server, waits CONFIG.TRADE_START_DELAY_SECONDS (5 s), sends it a trade
-	     request and only adds its up to four items once the joiner has
-	     confirmed its trade window is open. Both clients press accept 6 s after
-	     the items are in. A refused request is retried instead of ending the
-	     loop, and a trade that moves nothing is noticed and retried. It repeats
-	     until nothing tradable is left. The Default Gun and Default Knife in the
-	     Currents tab are never traded; Events and Classic items always are.
+	What happens, every cycle:
+	  1. The trade request goes out.
+	  2. This client's trade window opening IS the joiner having accepted; 2s
+	     later this side adds up to four weapons.
+	  3. 6s after the last item it presses accept (and checks the game took it),
+	     then confirms 1s later. The joiner presses 1s after this side.
+	  4. 0.5s after the window closes the next request goes out.
+	  5. It stops when nothing tradable is left. The Default Gun and Default
+	     Knife in Currents are never offered.
 
-	The timing and the accept/confirm handshake travel over a third topic
-	("<server topic>_sync"), so host and joiner wait for each other instead of
-	only guessing from timers. The joiner's half lives in joiner.lua.
-
-	The card in the corner shows the host name, the job id and the joiner, and
-	has a Stop button, so the person running this stays in control.
-
-	Read the notes next to this file for setup and limits.
+	Both scripts need the same ROOM. CONFIG.RELAY_URL only has to be reachable
+	for the relay messages (who is who, and "finished"): every step above is
+	timed off the trade window and the clock, so a slow, rate-limited or dead
+	relay cannot delay or block a trade.
+	Set CONFIG.TARGET to a username to trade with that person instead of whoever
+	else is in this server.
 ]]
 
 --------------------------------------------------------------------------
@@ -41,46 +36,9 @@ local CONFIG = {
 	-- Message relay. ntfy.sh needs no signup.
 	RELAY_URL = "https://ntfy.sh",
 
-	-- Republish this often even if nothing changed, so the joiner can tell the
-	-- info is fresh. ntfy.sh allows 250 messages/day; 10 minutes stays under it.
-	HEARTBEAT_SECONDS = 600,
-
-	-- While this client is free - nobody has announced themselves and no trade
-	-- is running - republish faster. A joiner treats server info this fresh as
-	-- "somebody is hosting right now", so it can join from one read on the
-	-- first try instead of pinging, waiting and reading again. 30 seconds adds
-	-- about two messages a minute, and only while somebody is actually wanted.
-	AVAILABLE_HEARTBEAT_SECONDS = 30,
-
-	-- How often to notice that the server changed (e.g. after a game teleport).
-	CHECK_SECONDS = 3,
-
-	-- Seconds before retrying after a failed publish.
-	RETRY_SECONDS = 20,
-
-	-- How often to check the joiner topic for a new announcement.
-	PRESENCE_POLL_SECONDS = 4,
-
-	-- Only announcements published within this many minutes are read at all.
-	PRESENCE_MAX_AGE_MINUTES = 30,
-
-	-- A joiner announces itself right before it teleports, so an announcement
-	-- older than this belongs to somebody who is not coming any more. Without
-	-- this, an old announcement for this server (from a previous run) made the
-	-- host believe a joiner was on the way and stop answering pings forever.
-	JOINER_ANNOUNCE_MAX_AGE_SECONDS = 300,
-
-	-- If the announced joiner never shows up in the Players list, stop waiting
-	-- for them, so the host is available again for the next real joiner.
-	JOINER_ARRIVAL_TIMEOUT_SECONDS = 90,
-
 	-- Seconds between "the joiner is definitely in this server" and the first
 	-- trade request going out. This is the 5 second delay.
 	TRADE_START_DELAY_SECONDS = 5,
-
-	-- true  -> the trade loop starts by itself after TRADE_START_DELAY_SECONDS.
-	-- false -> you press "Run trade" yourself once the joiner is in.
-	TRADE_ON_DETECT = true,
 
 	-- The handshake, all in seconds:
 	--   request out --1s--> joiner accepts the request and says so
@@ -97,18 +55,14 @@ local CONFIG = {
 	NEXT_CYCLE_DELAY_SECONDS = 0.5,
 	ITEM_OFFER_GAP_SECONDS = 0.3,
 
-	-- How long to wait for the other side's event on the sync topic.
-	ACK_WAIT_SECONDS = 15,
+	-- How often the relay topic is read. The free relay refills about one request
+	-- every 5-10 seconds per network, and both clients share that budget, so a
+	-- slower read is what keeps it answering. Nothing below waits on it.
+	SYNC_POLL_SECONDS = 15,
 
-	-- How often the sync topic is read while a trade is running.
-	SYNC_POLL_SECONDS = 2,
-
-	-- Liveness handshake. A joiner that is looking for a host publishes a ping
-	-- on the joiner topic; this script answers it only while it really is
-	-- hosting. That way an old announcement from a server that is long gone (or
-	-- from this very client) can never attract anyone.
-	PING_ACK_SECONDS = 2,      -- minimum gap between two answers
-	PING_MAX_AGE_SECONDS = 120, -- ignore pings older than this
+	-- How often each side says who it is on the relay. This is the only traffic
+	-- that runs when no trade is happening.
+	HELLO_SECONDS = 30,
 
 	-- The game refuses a new request while a trade is open and for a moment
 	-- after one, so a failed request is retried instead of ending the loop.
@@ -156,8 +110,11 @@ local CONFIG = {
 	-- apart, before saying the check could not be confirmed.
 	EMPTY_READ_ATTEMPTS = 15,
 	EMPTY_READ_GAP_SECONDS = 3,
-}
 
+	-- Set to a Roblox username to trade with that person instead of whoever else
+	-- is in this server.
+	TARGET = "",
+}
 --------------------------------------------------------------------------
 -- Services and small helpers
 --------------------------------------------------------------------------
@@ -166,6 +123,11 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 
 local localPlayer = Players.LocalPlayer
+
+-- Printed at start-up so it is obvious which copy is running: v4 talks to the
+-- joiner over the relay, but no trade step waits on it.
+local BUILD = "v4"
+print("[Trade] host.lua " .. BUILD .. " for " .. tostring(localPlayer.DisplayName) .. " (@" .. tostring(localPlayer.Name) .. ")")
 
 local function waitSeconds(seconds)
 	if task and task.wait then
@@ -322,119 +284,7 @@ end
 
 local room = sanitizeRoom(CONFIG.ROOM)
 local topic = "fbshare_" .. room
-local presenceTopic = topic .. "_players"
 local relayBase = tostring(CONFIG.RELAY_URL):gsub("/+$", "")
-
--- v2|placeId|jobId|username|displayName|gameName|timestamp
-local function encodeInfo(place, job, username, displayName, gameName, timestamp)
-	return table.concat({
-		WIRE_VERSION,
-		tostring(place),
-		cleanText(tostring(job), 100),
-		cleanText(tostring(username), 40),
-		cleanText(tostring(displayName), 40),
-		cleanText(tostring(gameName), 60),
-		tostring(timestamp),
-	}, "|")
-end
-
--- j1|placeId|jobId|username|displayName|timestamp
-local function decodePresence(text)
-	if type(text) ~= "string" then
-		return nil
-	end
-	local parts = {}
-	for part in (text .. "|"):gmatch("([^|]*)|") do
-		parts[#parts + 1] = part
-	end
-	if #parts ~= 6 or parts[1] ~= PRESENCE_VERSION then
-		return nil
-	end
-
-	local place = tonumber(parts[2])
-	local job = parts[3]
-	local stamp = tonumber(parts[6])
-	local username = cleanText(parts[4], 40)
-
-	if not place or place <= 0 or math.floor(place) ~= place then
-		return nil
-	end
-	if type(job) ~= "string" or #job < 6 or #job > 100 or job:find("[^%w%-_%.]") then
-		return nil
-	end
-	if not stamp then
-		return nil
-	end
-	-- The joiner topic is public, so only accept something that looks like a
-	-- real Roblox username before it can ever become a trade target.
-	if username == "" or #username > 25 or username:find("[^%w_]") then
-		return nil
-	end
-
-	return {
-		place = place,
-		job = job,
-		username = username,
-		display = cleanText(parts[5], 40),
-		stamp = stamp,
-	}
-end
-
--- q1|placeId|username|timestamp
---
--- A joiner that has not found a host yet puts one of these on the joiner
--- topic, asking "is anybody actually hosting right now?". It is deliberately
--- a different version string from a joiner announcement, so it can never be
--- mistaken for somebody who is coming to this server.
-local QUERY_VERSION = "q1"
-
-local function decodeQuery(text)
-	if type(text) ~= "string" then
-		return nil
-	end
-	local parts = {}
-	for part in (text .. "|"):gmatch("([^|]*)|") do
-		parts[#parts + 1] = part
-	end
-	if #parts ~= 4 or parts[1] ~= QUERY_VERSION then
-		return nil
-	end
-
-	local place = tonumber(parts[2])
-	local stamp = tonumber(parts[4])
-	local username = cleanText(parts[3], 40)
-
-	if not place or place <= 0 or not stamp then
-		return nil
-	end
-	if username == "" or #username > 25 or username:find("[^%w_]") then
-		return nil
-	end
-
-	return {
-		place = place,
-		username = username,
-		stamp = stamp,
-	}
-end
-
--- h1|placeId|jobId|username|displayName|gameName|timestamp
---
--- The answer to a ping: "a host is running here, right now, in this job".
--- Decoded by joiner.lua before it follows anybody.
-local ACK_VERSION = "h1"
-
-local function encodeAck(place, job, username, displayName, gameName, timestamp)
-	return table.concat({
-		ACK_VERSION,
-		tostring(place),
-		cleanText(tostring(job), 100),
-		cleanText(tostring(username), 40),
-		cleanText(tostring(displayName), 40),
-		cleanText(tostring(gameName), 60),
-		tostring(timestamp),
-	}, "|")
-end
 
 local function relayPublishTo(topicName, text)
 	if httpRequest then
@@ -463,38 +313,46 @@ local function currentJobId()
 end
 
 --------------------------------------------------------------------------
--- Talking to the joiner while the trade runs
+-- Talking to the joiner
 --
--- A third topic, "<server topic>_sync", carries what each side just did: the
--- request went out, the items are in, accept was pressed. Both scripts wait
--- for the other side's event instead of only guessing from a timer, and every
--- event names the host and the joiner it belongs to, so two pairs sharing a
--- room never react to each other's messages.
---------------------------------------------------------------------------
+-- This is the relay from the first script, used the same way: a line is
+-- published to "fbshare_<room>" and the topic is read back with one GET on
+-- /raw?poll=1&since=30m. What changed is only what it is for. Both people are
+-- already in this server, so the username the trade request needs comes from
+-- the Players list, and the trade window itself says when the other side
+-- accepted. The relay confirms who is who (which matters with three or more
+-- people in the server) and says when this side is finished. No step of the
+-- trade waits on a message: a busy or unreachable relay costs a log line, not
+-- a trade.
+--
+-- The free relay refills roughly one request every five to ten seconds PER
+-- NETWORK, and both clients usually share one, so this side stays well under
+-- it: one read every SYNC_POLL_SECONDS, one hello every HELLO_SECONDS, and the
+-- per-cycle messages are dropped when they would land too close together.
 
-local syncTopic = topic .. "_sync"
-local SYNC_VERSION = "s1"
+local SYNC_VERSION = "t1"
 
--- Filled in further down. The trade code is defined before the UI and the
--- state table, so it needs the names up front and assigns to them there.
-local ui, state, setStatus, updateInfo, THEME
-
+-- One GET, the same call the first script used to read its topic.
 local function relayReadTopic(topicName, minutes)
 	local url = relayBase .. "/" .. topicName .. "/raw?poll=1&since=" .. tostring(minutes) .. "m"
 	return http(url, "GET")
 end
 
--- s1|event|placeId|jobId|cycle|payload|hostUsername|joinerUsername|timestamp
-local function encodeSync(event, joinerUsername, cycle, payload)
+-- Filled in further down. The trade code is defined before the UI and the
+-- state table, so it needs the names up front and assigns to them there.
+local ui, state, setStatus, updateInfo, THEME
+
+-- t1|place|job|cycle|event|payload|from|to|stamp
+local function encodeSync(event, toUsername, cycle, payload)
 	return table.concat({
 		SYNC_VERSION,
-		cleanText(tostring(event), 16),
 		tostring(tonumber(game.PlaceId) or 0),
 		cleanText(currentJobId(), 100),
 		tostring(tonumber(cycle) or 0),
+		cleanText(tostring(event), 16),
 		cleanText(tostring(payload or ""), 60),
 		cleanText(tostring(localPlayer.Name or ""), 40),
-		cleanText(tostring(joinerUsername or ""), 40),
+		cleanText(tostring(toUsername or ""), 40),
 		tostring(os.time()),
 	}, "|")
 end
@@ -511,147 +369,144 @@ local function decodeSync(text)
 		return nil
 	end
 
-	local place = tonumber(parts[3])
-	local job = parts[4]
-	local cycle = tonumber(parts[5])
+	local place = tonumber(parts[2])
+	local cycle = tonumber(parts[4])
 	local stamp = tonumber(parts[9])
-
-	if not place or place <= 0 then
-		return nil
-	end
-	if type(job) ~= "string" or #job < 6 or #job > 100 or job:find("[^%w%-_%.]") then
-		return nil
-	end
-	if not cycle or not stamp then
+	if not place or place <= 0 or not cycle or not stamp then
 		return nil
 	end
 
 	return {
-		event = cleanText(parts[2], 16),
 		place = place,
-		job = job,
+		job = cleanText(parts[3], 100),
 		cycle = cycle,
+		event = cleanText(parts[5], 16),
 		payload = cleanText(parts[6], 60),
-		host = cleanText(parts[7], 40),
-		joiner = cleanText(parts[8], 40),
+		from = cleanText(parts[7], 40),
+		to = cleanText(parts[8], 40),
 		stamp = stamp,
 	}
 end
 
--- The relay can rate limit (ntfy's free relay allows only so many requests a
--- minute). While it is down the fixed timings still drive the trade, so the
--- waits for the joiner's word are shortened rather than stalling every cycle.
-local syncTrouble = 0
+local sync = {
+	started = false,
+	polling = false,
+	events = {},
+	trouble = 0,
+	answered = false,
+	heard = false,
+	lastPublishAt = 0,
+	lastNoteAt = 0,
+}
 
-local function noteSync(ok)
-	if ok then
-		syncTrouble = 0
-	else
-		syncTrouble = syncTrouble + 1
+-- What the card shows about the relay. "local" is not a failure: the trade is
+-- driven by the trade window and the clock, and it runs the same either way.
+local function linkState()
+	if sync.heard then
+		return "relay + local"
+	elseif sync.answered then
+		return "local (relay silent)"
 	end
+	return "local"
 end
 
-local function publishSync(event, joinerUsername, cycle, payload)
-	local ok, status = relayPublishTo(syncTopic, encodeSync(event, joinerUsername, cycle, payload))
-	noteSync(ok)
-	if not ok then
-		print("[Trade] could not publish '" .. tostring(event) .. "' (error " .. tostring(status) .. ")")
+local MIN_PUBLISH_GAP = 4
+
+local function publishSync(event, toUsername, cycle, payload)
+	local now = nowSeconds()
+	local urgent = event == "hello" or event == "done" or event == "req"
+	if not urgent and now - sync.lastPublishAt < MIN_PUBLISH_GAP then
+		return false
+	end
+	sync.lastPublishAt = now
+	local ok, status = relayPublish(encodeSync(event, toUsername, cycle, payload))
+	if not ok and now - sync.lastNoteAt > 60 then
+		sync.lastNoteAt = now
+		print("[Trade] relay publish skipped (" .. tostring(status) .. ") - the trade does not wait on it")
 	end
 	return ok
 end
 
---------------------------------------------------------------------------
--- The joiner's side of the conversation
---------------------------------------------------------------------------
-
-local sync = {
-	started = false,
-	busy = false,
-	events = {},
-}
-
-local function recordSync(entry)
-	local current = sync.events[entry.event]
-	if current == nil or entry.cycle >= current.cycle then
-		sync.events[entry.event] = entry
-	end
-end
-
-local function pollSync(myJob, joinerUsername)
-	if sync.busy then
+local function pollSync(myJob, otherUsername)
+	if sync.polling then
 		return
 	end
-	sync.busy = true
-	local ok, status, body = relayReadTopic(syncTopic, 10)
-	sync.busy = false
+	sync.polling = true
+	local ok, status, body = relayReadTopic(topic, 30)
+	sync.polling = false
 
 	if not ok then
-		noteSync(false)
-		if status == 429 then
-			waitSeconds(5)
+		sync.trouble = sync.trouble + 1
+		if nowSeconds() - sync.lastNoteAt > 60 then
+			sync.lastNoteAt = nowSeconds()
+			if status == 429 then
+				print("[Trade] the relay is busy (429) - the trade keeps its own clock, nothing is blocked")
+			else
+				print("[Trade] relay read failed (" .. tostring(status) .. ") - the trade keeps its own clock")
+			end
 		end
-		return
+		return false
 	end
-	noteSync(true)
+
+	sync.trouble = 0
+	sync.answered = true
 
 	local myPlace = tonumber(game.PlaceId) or 0
-	local wantedHost = tostring(localPlayer.Name or ""):lower()
-	local wantedJoiner = tostring(joinerUsername):lower()
-	local seen = {}
+	local me = tostring(localPlayer.Name or ""):lower()
+	local other = tostring(otherUsername or ""):lower()
 
 	for line in tostring(body):gmatch("[^\r\n]+") do
 		local entry = decodeSync(line)
-		if entry
+		if entry ~= nil
 			and entry.place == myPlace
-			and entry.job == myJob
-			and entry.host:lower() == wantedHost
-			and entry.joiner:lower() == wantedJoiner
+			and (myJob == "" or entry.job == "" or entry.job == myJob)
+			and entry.from:lower() ~= me
+			and (other == "" or entry.from:lower() == other)
+			and (entry.to == "" or entry.to:lower() == me)
 		then
-			local key = entry.event .. "#" .. tostring(entry.stamp)
-			if not seen[key] then
-				seen[key] = true
-				recordSync(entry)
+			if entry.event == "hello" then
+				if not sync.heard then
+					print("[Trade] the relay confirmed the other side: " .. entry.from .. " (" .. tostring(entry.payload) .. ")")
+				end
+				sync.heard = true
+			else
+				local current = sync.events[entry.event]
+				if current == nil or entry.cycle > current.cycle
+					or (entry.cycle == current.cycle and entry.stamp >= current.stamp) then
+					sync.events[entry.event] = entry
+				end
 			end
 		end
 	end
+	return true
 end
 
-local function startSyncPolling(joinerUsername)
+-- One loop does both jobs: say hello now and then, and read the topic. The
+-- pause doubles while the relay is refusing, so a rate limit is waited out
+-- quietly instead of hammering the topic.
+local function startRelayLoop(otherUsername)
 	if sync.started then
 		return
 	end
 	sync.started = true
 	local myJob = currentJobId()
 	spawnThread(function()
+		local nextHelloAt = 0
 		while state ~= nil and state.running do
-			pollSync(myJob, joinerUsername)
-			waitSeconds(CONFIG.SYNC_POLL_SECONDS)
+			if nowSeconds() >= nextHelloAt then
+				publishSync("hello", otherUsername or "", 0, "host")
+				nextHelloAt = nowSeconds() + CONFIG.HELLO_SECONDS
+			end
+			pollSync(myJob, otherUsername or "")
+			local pause = CONFIG.SYNC_POLL_SECONDS
+			if sync.trouble > 0 then
+				pause = math.min(60, pause * (1 + sync.trouble))
+			end
+			waitSeconds(pause)
 		end
 	end)
 end
 
--- Waits until the joiner has reported `event` for `cycle`. Returns whether it
--- arrived, and the payload that came with it ("ok", "nowindow", ...).
-local function waitForSync(event, cycle, timeoutSeconds)
-	-- With the relay silent, waiting the full time only delays the trade.
-	if syncTrouble >= 3 and timeoutSeconds > 3 then
-		timeoutSeconds = 3
-	end
-	local deadline = nowSeconds() + timeoutSeconds
-	while state ~= nil and state.running do
-		local entry = sync.events[event]
-		if entry ~= nil and entry.cycle >= cycle then
-			return true, entry.payload
-		end
-		if nowSeconds() >= deadline then
-			return false, nil
-		end
-		waitSeconds(0.25)
-	end
-	return false, nil
-end
-
---------------------------------------------------------------------------
 -- Trade actions on this client
 --------------------------------------------------------------------------
 
@@ -1507,7 +1362,7 @@ local function runTradeLoop(targetPlayer, targetUsername)
 	local traded = 0
 	local emptyCycles = 0
 
-	startSyncPolling(targetUsername)
+	startRelayLoop(targetUsername)
 
 	-- One full round trip. "ok" means the items left the inventory, "retry"
 	-- means this trade did not happen at all, "stop" means the script is done.
@@ -1520,14 +1375,6 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		if tradeGui() ~= nil then
 			waitForTradeClosed(CONFIG.TRADE_CLOSE_SECONDS)
 		end
-
-		-- Every attempt starts with a clean slate: the verdict from the previous
-		-- attempt ("nowindow", a stale accept, ...) is never reused as if it
-		-- belonged to the request that is about to go out.
-		sync.events["reqok"] = nil
-		sync.events["items"] = nil
-		sync.events["accept"] = nil
-		sync.events["confirm"] = nil
 
 		local requested, requestError = requestTrade(targetPlayer, targetUsername, cycle)
 		if not requested then
@@ -1545,10 +1392,10 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		-- not from a refused attempt before it.
 		local cycleStartedAt = nowSeconds()
 
-		-- Two independent proofs that the joiner accepted: it says so the moment
-		-- its window opens, and the server opens this client's window at the same
-		-- instant. Either is enough, so a window that lags behind or a quiet relay
-		-- can never stall the cycle.
+		-- The window opening HERE is the joiner having accepted: the server only
+		-- opens the trade for a request that was accepted. Both clients can see
+		-- that for themselves, so adding the items starts on this fact and not on
+		-- a message that might not arrive.
 		local acceptedAt = nil
 		local deadline = nowSeconds() + CONFIG.REQUEST_ACK_SECONDS
 		while state.running and nowSeconds() < deadline do
@@ -1557,29 +1404,15 @@ local function runTradeLoop(targetPlayer, targetUsername)
 				print(string.format("[Trade] %s accepted - the trade window is open", targetUsername))
 				break
 			end
-			local reply = sync.events["reqok"]
-			if reply ~= nil and reply.cycle >= cycle and tostring(reply.payload) == "open" then
-				acceptedAt = nowSeconds()
-				print("[Trade] " .. targetUsername .. " says it accepted the request")
-				break
-			end
 			waitSeconds(0.2)
 		end
 
 		if acceptedAt == nil then
-			-- The relay may know why it never opened; ask it, then send the same
-			-- request again instead of adding items into nothing.
-			local joinerReady, readyPayload = waitForSync("reqok", cycle, 2)
-			if joinerReady and tostring(readyPayload) == "nowindow" then
-				print("[Trade] " .. targetUsername .. " says its trade window never opened - sending the request again")
-			else
-				print("[Trade] the trade window never opened after the request - sending the request again")
-			end
-			setStatus(string.format(
-				"Cycle %d: the trade window did not open - asking %s again...",
-				cycle,
-				targetUsername
-			), THEME.amber)
+			print("[Trade] the trade window never opened after the request - sending the request again")
+			setStatus(
+				string.format("Cycle %d: the trade window did not open - asking %s again...", cycle, targetUsername),
+				THEME.amber
+			)
 			return "retry"
 		end
 		print(string.format(
@@ -1604,8 +1437,10 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			print("[Trade] offered " .. tostring(itemName))
 			waitSeconds(CONFIG.ITEM_OFFER_GAP_SECONDS)
 		end
-		-- Tell the joiner the items are all in. From here that message is only a
-		-- backup clock: the joiner waits for the "accept now" message below.
+
+		local lastItemAt = nowSeconds()
+		-- Told, never waited on: it is the joiner's backup clock for the case
+		-- where its own window does not show the items.
 		publishSync("items", targetUsername, cycle, tostring(#batch))
 		print(string.format(
 			"[Trade] all %d item(s) added - this side accepts in %ss, then %s accepts %ss later",
@@ -1615,7 +1450,7 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			tostring(CONFIG.JOINER_ACCEPT_DELAY_SECONDS)
 		))
 
-		local acceptAt = nowSeconds() + CONFIG.ACCEPT_DELAY_SECONDS
+		local acceptAt = lastItemAt + CONFIG.ACCEPT_DELAY_SECONDS
 		while state.running do
 			local left = acceptAt - nowSeconds()
 			if left <= 0 then
@@ -1628,10 +1463,7 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			return "stop"
 		end
 
-		-- The moment this side presses accept, the joiner is told to press its own
-		-- accept JOINER_ACCEPT_DELAY_SECONDS later. That message is what keeps the
-		-- two presses in the right order, so the joiner reports a fact rather than
-		-- a guess, and this side only proceeds once it hears that report.
+		-- Told as it happens, so the console on both sides shows the same order.
 		publishSync("acceptgo", targetUsername, cycle, "now")
 		print("[Trade] told " .. targetUsername .. ": accepting now - press accept in " .. tostring(CONFIG.JOINER_ACCEPT_DELAY_SECONDS) .. "s")
 
@@ -1644,47 +1476,29 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			return "retry"
 		end
 		publishSync("hostaccept", targetUsername, cycle, "ok")
-		print("[Trade] this side accepted the items - waiting for " .. targetUsername .. " to say the same")
+		print("[Trade] this side accepted the items")
 
-		local joinerAccepted, joinerPayload = waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS)
-		if joinerAccepted and tostring(joinerPayload) ~= "ok" then
-			-- The joiner could not accept. Confirming here would close a trade
-			-- nobody agreed to, so hand the cycle back instead.
-			print("[Trade] " .. targetUsername .. " reported its accept as '" .. tostring(joinerPayload) .. "' - asking again instead of confirming")
-			return "retry"
-		end
-		if not joinerAccepted then
-			-- One more window before giving up on the message: the relay can lag.
-			print("[Trade] no word from " .. targetUsername .. " yet - waiting for it before confirming")
-			joinerAccepted, joinerPayload = waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS)
-		end
-		if joinerAccepted and tostring(joinerPayload) ~= "ok" then
-			print("[Trade] " .. targetUsername .. " reported its accept as '" .. tostring(joinerPayload) .. "' - asking again instead of confirming")
-			return "retry"
-		end
-		if joinerAccepted then
-			setStatus(string.format("Cycle %d: %s accepted too - confirming.", cycle, targetUsername), THEME.green)
-			print("[Trade] " .. targetUsername .. " says it accepted too - both sides are in, confirming")
-		else
-			-- Both sides have to confirm for a trade to run, so confirming here can
-			-- never move items on its own - it only stops an open window hanging.
-			print("[Trade] WARNING: " .. targetUsername .. " never said it accepted. Both sides were told to accept; confirming so the trade does not hang on an open window.")
-			setStatus(string.format(
-				"Cycle %d: no word from %s - confirming so the trade does not hang.",
-				cycle,
-				targetUsername
-			), THEME.amber)
-		end
-
+		-- The joiner was told the same moment and presses accept one second after
+		-- this side, then confirms a second after that. Confirming on the clock
+		-- keeps the two sides together without a round trip; a trade only runs
+		-- when BOTH sides confirm, so an early confirm here cannot move anything
+		-- on its own.
 		waitSeconds(CONFIG.CONFIRM_DELAY_SECONDS)
-
 		local confirmed, confirmErr = pressConfirm()
 		if not confirmed then
 			print("[Trade] could not press confirm: " .. tostring(confirmErr))
 		end
-		-- No "confirm" message is sent: the window closing is the signal that this
-		-- cycle is over, and every message saved here is one the relay can spend
-		-- on the next cycle's request.
+
+		-- If the window is still up a few seconds later, the joiner's own confirm
+		-- had not landed yet: press once more rather than leaving it hanging.
+		local recheck = nowSeconds() + 4
+		while state.running and nowSeconds() < recheck and tradeGui() ~= nil do
+			waitSeconds(0.25)
+		end
+		if tradeGui() ~= nil then
+			print("[Trade] the trade window is still open - pressing confirm once more")
+			pressConfirm()
+		end
 
 		-- The next request cannot go out while this window is still up.
 		waitForTradeClosed(CONFIG.TRADE_CLOSE_SECONDS)
@@ -1717,6 +1531,7 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		))
 		return "ok"
 	end
+
 
 	while state.running do
 		local queue, info = getFreshWeaponQueue()
@@ -1800,7 +1615,16 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		end
 	end
 
-	publishSync("done", targetUsername, cycle, tostring(traded))
+	-- Said a few times, because the relay is allowed to refuse and the joiner's
+	-- card is nicer when it knows. Nothing depends on it: a joiner that never
+	-- hears it simply waits for a request that is not coming.
+	for _ = 1, 3 do
+		publishSync("done", targetUsername, cycle, tostring(traded))
+		if not state.running then
+			break
+		end
+		waitSeconds(6)
+	end
 	print(string.format("[Trade] finished after %d cycle(s), %d item(s) traded.", cycle, traded))
 	return true
 end
@@ -2077,18 +1901,17 @@ ui = buildUI()
 -- Who is running this script
 --------------------------------------------------------------------------
 
+
 local gameName = cleanText(tostring(game.Name or ""), 60)
 if gameName == "" then
 	gameName = "Unknown game"
 end
 
--- This is the name the joiner sees on its card.
 local hostDisplay = cleanText(tostring(localPlayer.DisplayName or localPlayer.Name or ""), 40)
 if hostDisplay == "" then
 	hostDisplay = "Unknown player"
 end
 
--- This is the exact Roblox username, and the one other scripts should match.
 local hostUsername = cleanText(tostring(localPlayer.Name or ""), 40)
 if hostUsername == "" then
 	hostUsername = "Unknown player"
@@ -2100,22 +1923,14 @@ local placeId = tonumber(game.PlaceId) or 0
 -- State
 --------------------------------------------------------------------------
 
+
 state = {
 	running = true,
-	-- server info publishing
-	lastSentAt = 0,
-	lastAttemptAt = 0,
-	lastOk = false,
-	sentCount = 0,
-	lastJob = nil,
-	-- joiner tracking
-	seen = {},        -- lowercased username -> true once it has been queued
-	queue = {},       -- announcements waiting to be matched to a player
-	active = nil,     -- { username, display, stamp, player, detectedAt, started }
+	active = nil,     -- { username, display, firstSeen }
 	tradeStarted = false,
 	tradeRunning = false,
 	tradeTarget = nil,
-	finished = false, -- every trade is done; stop advertising this server
+	finished = false,
 }
 
 setStatus = function(text, color)
@@ -2125,37 +1940,68 @@ setStatus = function(text, color)
 end
 
 updateInfo = function()
-	local job = currentJobId()
-	local place = tonumber(game.PlaceId) or placeId
 	local lines = {
 		"Host: " .. hostDisplay .. " (@" .. hostUsername .. ")",
 		"Game: " .. gameName,
-		"Place: " .. tostring(place),
-		"Job: " .. (job == "" and "not available yet" or job),
+		"Place: " .. tostring(tonumber(game.PlaceId) or placeId),
+		"Job: " .. (currentJobId() == "" and "not available yet" or currentJobId()),
 	}
 
-	if state.finished and state.tradeTarget then
-		lines[#lines + 1] = "Joiner: " .. state.tradeTarget .. " (finished)"
-	elseif state.tradeRunning and state.tradeTarget then
-		lines[#lines + 1] = "Joiner: " .. state.tradeTarget .. " (trade running)"
-	elseif state.active then
-		if state.active.player then
-			lines[#lines + 1] = "Joiner: " .. state.active.player.Name .. " (in server)"
-		else
-			lines[#lines + 1] = "Joiner: " .. state.active.username .. " (coming)"
-		end
-	elseif #state.queue > 0 then
-		lines[#lines + 1] = "Joiner: " .. state.queue[1].username .. " (coming)"
+	if state.tradeTarget ~= nil then
+		lines[#lines + 1] = "CONNECTED: " .. state.tradeTarget .. (state.finished and " (finished)" or " (trading now)")
+	elseif state.active ~= nil then
+		lines[#lines + 1] = "CONNECTED: " .. state.active.username
 	else
-		lines[#lines + 1] = "Joiner: waiting"
+		lines[#lines + 1] = "NOT CONNECTED: nobody else in this server yet"
 	end
 
+	lines[#lines + 1] = "Link: " .. linkState()
 	ui.info.Text = table.concat(lines, "\n")
+end
+
+--------------------------------------------------------------------------
+-- Who to trade with
+--------------------------------------------------------------------------
+
+--
+-- Nothing joins anybody: both people are already in this server. The other side
+-- of the trade is simply the other player in the Players list, so there is no
+-- handshake to wait for - the username the trade request needs is read straight
+-- from the game.
+
+local function findPlayerByUsername(username)
+	local wanted = tostring(username):lower()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= localPlayer and player.Name:lower() == wanted then
+			return player
+		end
+	end
+	return nil
+end
+
+-- The other person in this server: with one host and one joiner that is the
+-- side this one trades with.
+local function theOtherPlayer()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= localPlayer then
+			return player
+		end
+	end
+	return nil
+end
+
+-- CONFIG.TARGET pins a username; otherwise it is whoever else is here.
+local function resolveTarget()
+	if CONFIG.TARGET ~= nil and tostring(CONFIG.TARGET) ~= "" then
+		return findPlayerByUsername(tostring(CONFIG.TARGET))
+	end
+	return theOtherPlayer()
 end
 
 --------------------------------------------------------------------------
 -- Running the coordinated trade loop with the joiner
 --------------------------------------------------------------------------
+
 
 local function runTrade(targetPlayer, targetUsername)
 	if state.tradeStarted then
@@ -2190,7 +2036,7 @@ local function runTrade(targetPlayer, targetUsername)
 		state.finished = true
 		ui.trade.Text = "Finished"
 		setStatus(
-			"Done. Every tradable item is gone; only the Default Gun and Default Knife are left. This server is no longer advertised.",
+			"Done. Every tradable item is gone; only the Default Gun and Default Knife are left.",
 			THEME.green
 		)
 		updateInfo()
@@ -2202,280 +2048,43 @@ local function runTrade(targetPlayer, targetUsername)
 end
 
 --------------------------------------------------------------------------
--- Finding the joiner in this server
---------------------------------------------------------------------------
-
--- Only the exact Roblox username is trusted, because that same string ends up
--- as the trade target. Display names are only shown, never matched.
-local function findPlayerByUsername(username)
-	local wanted = tostring(username):lower()
-	for _, player in ipairs(Players:GetPlayers()) do
-		if player ~= localPlayer and player.Name:lower() == wanted then
-			return player
-		end
-	end
-	return nil
-end
-
--- Answers "is anybody hosting right now?", so a joiner only ever follows a
--- host that is actually alive. It stays quiet once somebody is already on the
--- way, while a trade runs, and after the last trade is done.
-local lastPingReplyAt = 0
-local lastPingKey = nil
-
-local function hostingAvailable()
-	if not state.running or state.finished then
-		return false
-	end
-	if state.tradeStarted or state.tradeRunning or state.active ~= nil then
-		return false
-	end
-	return #state.queue == 0
-end
-
-local function answerPing(ping, myPlace, myJob)
-	if not hostingAvailable() then
-		return
-	end
-	-- The same ping stays visible on the topic for minutes, so answer each one
-	-- once. ntfy.sh only allows a limited number of messages per day.
-	local key = ping.username:lower() .. "|" .. tostring(ping.stamp)
-	if key == lastPingKey then
-		return
-	end
-	if os.time() - lastPingReplyAt < CONFIG.PING_ACK_SECONDS then
-		return
-	end
-	lastPingKey = key
-	lastPingReplyAt = os.time()
-	local ok, status = relayPublishTo(
-		presenceTopic,
-		encodeAck(myPlace, myJob, hostUsername, hostDisplay, gameName, os.time())
-	)
-	if ok then
-		print("[Server Share] " .. ping.username .. " asked for a host - told them this server is live")
-	else
-		print("[Server Share] could not answer " .. ping.username .. " (error " .. tostring(status) .. ")")
-	end
-end
-
-local function collectJoiners()
-	local myJob = currentJobId()
-	if myJob == "" then
-		return
-	end
-
-	local url = relayBase .. "/" .. presenceTopic .. "/raw?poll=1&since=" .. tostring(CONFIG.PRESENCE_MAX_AGE_MINUTES) .. "m"
-	local ok, status, body = http(url, "GET")
-	if not ok then
-		if status == 429 then
-			print("[Server Share] joiner topic is rate limiting this network")
-		else
-			print("[Server Share] could not read the joiner topic (error " .. tostring(status) .. ")")
-		end
-		return
-	end
-
-	local myPlace = tonumber(game.PlaceId) or 0
-	local found = {}
-	local newestPing = nil
-
-	for line in tostring(body):gmatch("[^\r\n]+") do
-		local query = decodeQuery(line)
-		if query then
-			if query.username:lower() ~= hostUsername:lower()
-				and os.time() - query.stamp <= CONFIG.PING_MAX_AGE_SECONDS
-				then
-				if newestPing == nil or query.stamp > newestPing.stamp then
-					newestPing = query
-				end
-			end
-		end
-
-		local entry = decodePresence(line)
-		if entry and entry.place == myPlace and entry.job == myJob
-			and os.time() - entry.stamp <= CONFIG.JOINER_ANNOUNCE_MAX_AGE_SECONDS then
-			-- One key per message, not per person: the same announcement is
-			-- handled once, while a fresh announcement from the same person (a
-			-- new timestamp) is still picked up.
-			local name = entry.username:lower()
-			local key = name .. "|" .. tostring(entry.stamp)
-			local alreadyQueued = false
-			if not state.seen[key] and name ~= hostUsername:lower() then
-				for _, queued in ipairs(state.queue) do
-					if queued.username:lower() == name then
-						alreadyQueued = true
-						break
-					end
-				end
-				if not alreadyQueued then
-					entry.key = key
-					found[#found + 1] = entry
-				end
-			end
-		end
-	end
-
-	table.sort(found, function(a, b)
-		return a.stamp < b.stamp
-	end)
-
-	for _, entry in ipairs(found) do
-		state.seen[entry.key or entry.username:lower()] = true
-		state.queue[#state.queue + 1] = entry
-		print("[Server Share] joiner announced: " .. entry.username .. " (" .. entry.display .. ")")
-	end
-
-	if #found > 0 then
-		updateInfo()
-	end
-
-	if newestPing ~= nil then
-		answerPing(newestPing, myPlace, myJob)
-	end
-end
-
-local function startCountdown(active)
-	spawnThread(function()
-		local total = CONFIG.TRADE_START_DELAY_SECONDS
-		while state.running and state.active == active and not active.started do
-			local remaining = total - (nowSeconds() - active.detectedAt)
-			if remaining <= 0 then
-				break
-			end
-			if active.player == nil or active.player.Parent == nil then
-				return
-			end
-			setStatus(string.format(
-				"%s is in the server. Sending the first trade request in %d...",
-				active.player.Name,
-				math.ceil(remaining)
-			), THEME.green)
-			waitSeconds(math.min(1, math.max(0.1, remaining)))
-		end
-
-		if not state.running or state.active ~= active or active.started then
-			return
-		end
-		if active.player == nil or active.player.Parent == nil then
-			setStatus(active.username .. " left before the trade could start.", THEME.red)
-			state.active = nil
-			updateInfo()
-			return
-		end
-
-		active.started = true
-		if CONFIG.TRADE_ON_DETECT then
-			runTrade(active.player, active.player.Name)
-		else
-			setStatus(active.player.Name .. " is in the server. Press Run trade to start.", THEME.green)
-		end
-	end)
-end
-
---------------------------------------------------------------------------
--- Share loop (server info)
---------------------------------------------------------------------------
-
-local function publish()
-	if state.finished then
-		-- Everything has been traded, so this server should not attract a new
-		-- joiner any more. The card stays, the advertising stops.
-		return true
-	end
-
-	local job = currentJobId()
-	local place = tonumber(game.PlaceId) or placeId
-
-	if job == "" then
-		updateInfo()
-		setStatus("This client did not expose a Job ID. Rejoin the server and run the script again.", THEME.red)
-		return false
-	end
-
-	if state.lastJob ~= nil and job ~= state.lastJob then
-		-- The server changed, so anything announced for the old one no longer counts.
-		state.queue = {}
-		state.seen = {}
-		state.active = nil
-		updateInfo()
-	end
-
-	local payload = encodeInfo(place, job, hostUsername, hostDisplay, gameName, os.time())
-	local ok, status = relayPublish(payload)
-	state.lastAttemptAt = os.time()
-	state.lastOk = ok
-
-	if ok then
-		state.sentCount = state.sentCount + 1
-		state.lastSentAt = os.time()
-		state.lastJob = job
-		updateInfo()
-		if not state.active and not state.tradeStarted then
-			setStatus("Live - shared at " .. os.date("%H:%M:%S") .. " (room " .. room .. ")", THEME.green)
-		else
-			ui.dot.BackgroundColor3 = THEME.green
-		end
-		return true
-	end
-
-	if status == 429 then
-		setStatus("Relay is rate limiting this network. Will retry shortly.", THEME.amber)
-	else
-		setStatus("Could not reach the relay (error " .. tostring(status) .. "). Retrying...", THEME.red)
-	end
-	return false
-end
-
---------------------------------------------------------------------------
 -- Buttons
 --------------------------------------------------------------------------
+
 
 ui.stop.MouseButton1Click:Connect(function()
 	state.running = false
 	ui.gui:Destroy()
-	print("[Server Share] stopped sharing room '" .. room .. "'")
+	print("[Trade] stopped room '" .. room .. "'")
 end)
 
 ui.trade.MouseButton1Click:Connect(function()
 	if state.tradeStarted then
-		setStatus("The trade script is already running for " .. tostring(state.tradeTarget) .. ".", THEME.amber)
+		setStatus("The trade loop is already running for " .. tostring(state.tradeTarget) .. ".", THEME.amber)
 		return
 	end
-	if state.active and state.active.player then
-		state.active.started = true
-		runTrade(state.active.player, state.active.player.Name)
+	local target = resolveTarget()
+	if target ~= nil then
+		runTrade(target, target.Name)
 		return
 	end
-	if state.active then
-		setStatus(state.active.username .. " has announced this server but is not in it yet.", THEME.amber)
-		return
-	end
-	if #state.queue > 0 then
-		setStatus(state.queue[1].username .. " has announced this server but is not in it yet.", THEME.amber)
-		return
-	end
-	setStatus("No joiner has announced this server yet.", THEME.amber)
+	setStatus("Nobody else is in this server yet.", THEME.amber)
 end)
 
 ui.copy.MouseButton1Click:Connect(function()
-	local job = currentJobId()
-	if job == "" then
-		return
-	end
 	local copied = false
 	local environment = type(getgenv) == "function" and getgenv() or _G
 	for _, name in ipairs({ "setclipboard", "toclipboard" }) do
 		local fn = rawget(environment, name)
 		if type(fn) == "function" then
-			local ok = pcall(fn, job)
+			local ok = pcall(fn, room)
 			copied = copied or ok
 		end
 	end
 	ui.copy.Text = copied and "Copied" or "Copy failed"
 	waitSeconds(1.2)
 	if ui.gui.Parent then
-		ui.copy.Text = "Copy Job ID"
+		ui.copy.Text = "Copy Room"
 	end
 end)
 
@@ -2483,9 +2092,10 @@ end)
 -- Start
 --------------------------------------------------------------------------
 
+
 if not httpAvailable then
-	setStatus("This executor does not expose HTTP requests, so nothing can be shared or received.", THEME.red)
-	print("[Server Share] this executor does not expose HTTP requests")
+	setStatus("This executor does not expose HTTP requests, so it cannot talk to the joiner.", THEME.red)
+	print("[Trade] this executor does not expose HTTP requests")
 	return
 end
 
@@ -2493,89 +2103,34 @@ updateInfo()
 setStatus("Starting...", THEME.amber)
 
 spawnThread(function()
-	publish()
-	while state.running do
-		waitSeconds(CONFIG.CHECK_SECONDS)
-		if not state.running then
-			break
-		end
-		local job = currentJobId()
-		local now = os.time()
-		if job ~= "" and job ~= state.lastJob then
-			publish()
-		elseif not state.lastOk and now - state.lastAttemptAt >= CONFIG.RETRY_SECONDS then
-			publish()
-		elseif now - state.lastSentAt >= (hostingAvailable() and CONFIG.AVAILABLE_HEARTBEAT_SECONDS or CONFIG.HEARTBEAT_SECONDS) then
-			-- Free to take a joiner: keep the info fresh so a joiner can join
-			-- straight off a single read. Busy: go back to the slow heartbeat.
-			publish()
-		end
-	end
-end)
-
-spawnThread(function()
-	local lastPoll = 0
-	while state.running do
-		local now = os.time()
-
-		if now - lastPoll >= CONFIG.PRESENCE_POLL_SECONDS then
-			lastPoll = now
-			collectJoiners()
-		end
-
-		-- Promote the oldest announcement to "the joiner we are waiting for".
-		if not state.active and not state.tradeStarted and #state.queue > 0 then
-			local entry = table.remove(state.queue, 1)
-			state.active = {
-				username = entry.username,
-				display = entry.display,
-				key = entry.key,
-				stamp = entry.stamp,
-				queuedAt = now,
-				player = nil,
-				detectedAt = nil,
-				started = false,
-			}
-			updateInfo()
+	local announced = false
+	while state.running and not state.tradeStarted do
+		local target = resolveTarget()
+		if target ~= nil then
+			print("[Trade] CONNECTED to " .. target.Name .. " (same server) - first trade request in " .. tostring(CONFIG.TRADE_START_DELAY_SECONDS) .. "s")
 			setStatus(
-				"Joiner " .. entry.username .. " announced this server. Waiting for them to appear...",
-				THEME.amber
+				"CONNECTED to " .. target.Name .. " - first trade request in " .. tostring(CONFIG.TRADE_START_DELAY_SECONDS) .. "s",
+				THEME.green
 			)
+			state.active = { username = target.Name }
+			updateInfo()
+			waitSeconds(CONFIG.TRADE_START_DELAY_SECONDS)
+			if state.running and not state.tradeStarted then
+				local again = resolveTarget()
+				if again ~= nil then
+					state.active = { username = again.Name }
+					runTrade(again, again.Name)
+				end
+			end
+			return
 		end
 
-		if state.active then
-			if state.active.player == nil then
-				local player = findPlayerByUsername(state.active.username)
-				if player then
-					state.active.player = player
-					state.active.detectedAt = nowSeconds()
-					updateInfo()
-					print("[Server Share] " .. player.Name .. " is in this server - first trade request in " .. tostring(CONFIG.TRADE_START_DELAY_SECONDS) .. "s")
-					startCountdown(state.active)
-				elseif now - (state.active.queuedAt or now) > CONFIG.JOINER_ARRIVAL_TIMEOUT_SECONDS then
-					-- They announced themselves but never arrived, so stop holding
-					-- this server for them: holding on is what kept the host from
-					-- answering other joiners.
-					print("[Server Share] " .. state.active.username .. " never arrived - free to share again")
-					state.active = nil
-					updateInfo()
-					setStatus("Live - shared at " .. os.date("%H:%M:%S") .. " (room " .. room .. ")", THEME.green)
-				end
-			elseif state.active.player.Parent == nil and not state.active.started then
-				setStatus(state.active.username .. " left before the trade could start.", THEME.red)
-				-- Forget them. Their processed announcement stays processed, so it
-				-- cannot be picked up again; a fresh one from them still can.
-				state.active = nil
-				updateInfo()
-			end
+		if not announced then
+			announced = true
+			print("[Trade] waiting for the other person to be in this server (both scripts must be in the SAME server)")
+			setStatus("NOT CONNECTED - waiting for the other person. Both scripts must be in the SAME server.", THEME.amber)
 		end
 
 		waitSeconds(1)
 	end
 end)
-
-if type(getgenv) == "function" then
-	getgenv().ServerShareHostGui = ui.gui
-end
-
-print("[Server Share] sharing room '" .. room .. "' as " .. hostUsername .. " (" .. hostDisplay .. ")")
