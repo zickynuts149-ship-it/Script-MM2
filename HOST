@@ -127,6 +127,17 @@ local CONFIG = {
 	-- traded away - the rest of Currents, and all of Events and Classic.
 	KEEP_TAB = "Current",
 	KEEP_ITEM_NAMES = { "default gun", "default knife" },
+
+	-- "Everything is traded" is only believed after the salvage list and every
+	-- tab have been read this many times in a row and shown nothing tradable.
+	DONE_CONFIRM_ATTEMPTS = 4,
+	DONE_CONFIRM_GAP_SECONDS = 4,
+
+	-- Reads that come back with nothing at all (the game rebuilding the list)
+	-- are not proof of anything. Keep re-reading this many times, this far
+	-- apart, before saying the check could not be confirmed.
+	EMPTY_READ_ATTEMPTS = 15,
+	EMPTY_READ_GAP_SECONDS = 3,
 }
 
 --------------------------------------------------------------------------
@@ -760,43 +771,235 @@ end
 --------------------------------------------------------------------------
 -- Reading the salvage / inventory
 --
--- Same tiers, same stack expansion and same container paths as your trade
--- script; only the target and the timing changed.
+-- Same tiers and same stack expansion as your trade script, but every weapons
+-- tab is discovered rather than listed, item cards are found by their label
+-- (the game does not name them the same way in every tab), and the only items
+-- left alone are the Default Gun and Default Knife while they sit in Currents.
 --------------------------------------------------------------------------
 
 local tradePaths = nil
 -- How many items were skipped as "keep" by the last read (Default Gun / Knife).
 local lastKeptCount = 0
+-- The names that were left alone by the last read.
+local lastKeptNames = {}
+-- Names already explained in the console, so the note is printed once.
+local sharedNoted = {}
 
+-- Lowercase, letters and digits only: "Default_Knife_ab12" and "Default Knife"
+-- then compare the way a player would read them.
+local function normalizeName(text)
+	local lowered = tostring(text or ""):lower()
+	return (lowered:gsub("[^%w]", ""))
+end
+
+local KEEP_KEYS = {}
+for _, name in ipairs(CONFIG.KEEP_ITEM_NAMES) do
+	KEEP_KEYS[#KEEP_KEYS + 1] = normalizeName(name)
+end
+
+-- True when a name is one of the two defaults. `lenient` also accepts a suffix
+-- ("Default_Knife_ab12" from the salvage list); the strict form is used for
+-- inventory cards, so a skin called "Default Gun Gold" is still traded.
+local function isKeepKey(key, lenient)
+	if key == nil or key == "" then
+		return false
+	end
+	for _, keep in ipairs(KEEP_KEYS) do
+		if key == keep then
+			return true
+		end
+		if lenient and #key > #keep and key:sub(1, #keep) == keep then
+			return true
+		end
+		if not lenient and #key > #keep and key:sub(1, #keep) == keep then
+			local rest = key:sub(#keep + 1)
+			if rest:match("^%d+$") then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- The tab an item sits in decides whether the keep rule applies at all: a
+-- Default Gun in Events or Classic is still traded away.
+local function tabMatchesKeepTab(tab)
+	if tab == nil then
+		-- Unknown tab: leave the default behind rather than trade it by accident.
+		return true
+	end
+	local name = tostring(tab)
+	if name == CONFIG.KEEP_TAB then
+		return true
+	end
+	return name:sub(1, #CONFIG.KEEP_TAB + 1) == CONFIG.KEEP_TAB .. "/"
+end
+
+local function isKeptItem(data)
+	if data == nil then
+		return false
+	end
+	if not isKeepKey(data.key, false) then
+		return false
+	end
+	return tabMatchesKeepTab(data.tab)
+end
+
+-- A child that may not exist, without ever hanging on it.
+local function childOf(parent, name, timeout)
+	if parent == nil then
+		return nil
+	end
+	local ok, found = pcall(function()
+		return parent:FindFirstChild(name) or parent:WaitForChild(name, timeout or 2)
+	end)
+	if ok and typeof(found) == "Instance" then
+		return found
+	end
+	return nil
+end
+
+-- The same, but without waiting: used while walking a list that is expected to
+-- be there already, where waiting on every label would add up to minutes.
+local function findChild(parent, name)
+	if parent == nil then
+		return nil
+	end
+	local ok, found = pcall(function()
+		return parent:FindFirstChild(name)
+	end)
+	if ok and typeof(found) == "Instance" then
+		return found
+	end
+	return nil
+end
+
+local function tradeRoots()
+	local ok, roots = pcall(function()
+		local gui = childOf(localPlayer, "PlayerGui", 10)
+		local main = childOf(gui, "MainGUI", 20)
+		local gameGui = childOf(main, "Game", 20)
+		return gameGui
+	end)
+	if ok and typeof(roots) == "Instance" then
+		return roots
+	end
+	return nil
+end
+
+-- Every weapons tab under Items.Container, whatever it is called. Current and
+-- Classic are found this way, and so is the Events group (Holiday ->
+-- Halloween, Christmas, ...): a tab the script has never heard of is still read
+-- and its items still traded.
+local function collectTabs(parent, prefix, list, depth)
+	if parent == nil or depth > 3 then
+		return
+	end
+	local ok, children = pcall(function()
+		return parent:GetChildren()
+	end)
+	if not ok or children == nil then
+		return
+	end
+	for _, node in ipairs(children) do
+		if node ~= nil and typeof(node) == "Instance" then
+			-- Item cards also have a Container child (the stack amount), so they
+			-- are told apart by the ItemName label that only cards carry.
+			if findChild(node, "ItemName") == nil then
+				local tabName = prefix ~= "" and (prefix .. "/" .. tostring(node.Name)) or tostring(node.Name)
+				local container = findChild(node, "Container")
+				if container ~= nil then
+					list[#list + 1] = { tab = tabName, node = container }
+				end
+				collectTabs(node, tabName, list, depth + 1)
+			end
+		end
+	end
+end
+
+local function salvageContainer(gameGui)
+	local crafting = childOf(gameGui, "Crafting", 15)
+	local inventory = childOf(crafting, "Inventory", 10) or crafting
+	local salvage = childOf(inventory, "Salvage", 10)
+	if salvage == nil then
+		local ok, found = pcall(function()
+			return gameGui:FindFirstChild("Salvage", true)
+		end)
+		if ok and typeof(found) == "Instance" then
+			salvage = found
+		end
+	end
+	if salvage == nil then
+		return nil
+	end
+	local scroll = childOf(salvage, "ScrollFrame", 3)
+	local container = childOf(scroll or salvage, "Container", 3)
+	return container or scroll or salvage
+end
+
+-- The three nodes every read needs: the Game gui, the tab holder and the
+-- salvage list. Cached, and re-found when a node the game rebuilt goes away.
 local function resolveTradePaths()
 	if tradePaths ~= nil then
-		return tradePaths
+		local alive = false
+		pcall(function()
+			alive = tradePaths.game.Parent ~= nil
+				and tradePaths.tabHolder.Parent ~= nil
+				and tradePaths.salvage.Parent ~= nil
+		end)
+		if alive then
+			return tradePaths
+		end
+		tradePaths = nil
 	end
-	local ok, paths = pcall(function()
-		local gui = localPlayer:WaitForChild("PlayerGui", 10)
-		local main = gui:WaitForChild("MainGUI", 15)
-		local gameGui = main:WaitForChild("Game", 15)
-		local inventory = gameGui:WaitForChild("Inventory"):WaitForChild("Main")
-			:WaitForChild("Weapons"):WaitForChild("Items"):WaitForChild("Container")
-		local salvage = gameGui:WaitForChild("Crafting"):WaitForChild("Inventory")
-			:WaitForChild("Salvage"):WaitForChild("ScrollFrame"):WaitForChild("Container")			local holiday = inventory:WaitForChild("Holiday"):WaitForChild("Container")
-			-- Every tab carries its own name: which tab an item is in decides
-			-- whether it may be traded (see KEEP_ITEM_NAMES).
-			return {
-				inventory = inventory,
-				salvage = salvage,
-				containers = {
-					{ tab = "Events", node = holiday:WaitForChild("Halloween"):WaitForChild("Container") },
-					{ tab = "Events", node = holiday:WaitForChild("Christmas"):WaitForChild("Container") },
-					{ tab = "Current", node = inventory:WaitForChild("Current"):WaitForChild("Container") },
-					{ tab = "Classic", node = inventory:WaitForChild("Classic"):WaitForChild("Container") },
-				},
-			}
-	end)
-	if ok and paths ~= nil then
-		tradePaths = paths
+
+	local gameGui = tradeRoots()
+	if gameGui == nil then
+		return nil
 	end
+	local inventoryGui = childOf(gameGui, "Inventory", 15)
+	local main = inventoryGui and childOf(inventoryGui, "Main", 10)
+	local weapons = main and childOf(main, "Weapons", 10)
+	local itemsNode = weapons and childOf(weapons, "Items", 10)
+	local tabHolder = itemsNode and childOf(itemsNode, "Container", 10)
+	if tabHolder == nil then
+		return nil
+	end
+	local salvage = salvageContainer(gameGui)
+	if salvage == nil then
+		return nil
+	end
+
+	tradePaths = { game = gameGui, tabHolder = tabHolder, salvage = salvage }
 	return tradePaths
+end
+
+-- The longest inventory name that fits a salvage frame name. The old version
+-- compared first words, which made every "Default_*" frame match "Default Gun";
+-- the longest fit cannot do that, so similarly named items keep their own tab.
+local function matchItem(frameName, index, cards)
+	local key = normalizeName(frameName)
+	if key == "" then
+		return nil
+	end
+	local exact = index[key]
+	if exact ~= nil then
+		return exact
+	end
+	local best, bestLen = nil, 0
+	for _, data in ipairs(cards) do
+		local candidate = data.key
+		if #candidate >= 4 then
+			if key:sub(1, #candidate) == candidate then
+				if #candidate > bestLen then
+					best, bestLen = data, #candidate
+				end
+			elseif #key >= 4 and candidate:sub(1, #key) == key and #key > bestLen then
+				best, bestLen = data, #key
+			end
+		end
+	end
+	return best
 end
 
 local function shuffleTable(list)
@@ -813,55 +1016,56 @@ end)
 local function getFreshWeaponQueue()
 	local paths = resolveTradePaths()
 	if paths == nil then
-		return nil
+		return nil, nil
 	end
 
-	local inventoryDataMap = {}
-	local sharedLabels = {}
+	local tabs = {}
+	collectTabs(paths.tabHolder, "", tabs, 0)
 
-	local function scanContainerForData(container, tabName)
-		local success, children = pcall(function()
-			return container:GetChildren()
+	local cards = {}
+	local index = {}
+	local shared = {}
+
+	for _, tab in ipairs(tabs) do
+		local ok, children = pcall(function()
+			return tab.node:GetChildren()
 		end)
-		if not success or not children then
-			return
-		end
-		for _, child in ipairs(children) do
-			if child.Name == "NewItem" then
-				local itemName = child:FindFirstChild("ItemName")
-				if itemName then
-					local label = itemName:FindFirstChild("Label")
-					if label and label:IsA("TextLabel") then
-						local colorSuccess, bgColor = pcall(function()
-							return itemName.BackgroundColor3
-						end)
-						local amountNum = 1
-						local containerChild = child:FindFirstChild("Container")
-						local amountObj = containerChild and containerChild:FindFirstChild("Amount")
-						if amountObj then
-							local extractedNumber = tostring(amountObj.Text or ""):match("%d+")
-							if extractedNumber then
-								amountNum = tonumber(extractedNumber) or 1
-							end
+		if ok and children ~= nil then
+			for _, card in ipairs(children) do
+				-- Cards are found by their label, not by name: the game does not
+				-- use the same name for every card in every tab.
+				local itemName = findChild(card, "ItemName")
+				local label = itemName and findChild(itemName, "Label")
+				if label ~= nil and label:IsA("TextLabel") then
+					local text = tostring(label.Text)
+					local key = normalizeName(text)
+					if key ~= "" then
+						local amount = 1
+						local cardContainer = findChild(card, "Container")
+						local amountObject = cardContainer and findChild(cardContainer, "Amount")
+						if amountObject ~= nil then
+							local digits = tostring(amountObject.Text or ""):match("%d+")
+							amount = tonumber(digits) or 1
 						end
-						if colorSuccess and bgColor then
-							local name = tostring(label.Text)
-							local data = {
-								color = bgColor,
-								amount = amountNum,
-								label = name,
-								tab = tabName,
-							}
-							local existing = inventoryDataMap[name]
-							if existing == nil then
-								inventoryDataMap[name] = data
-							elseif existing.tab ~= tabName then
-								-- The same name in two tabs. The Currents entry wins, because
-								-- that is the tab the Default Gun and Default Knife live in.
-								sharedLabels[name] = true
-								if existing.tab ~= CONFIG.KEEP_TAB and tabName == CONFIG.KEEP_TAB then
-									inventoryDataMap[name] = data
-								end
+						local data = {
+							label = text,
+							key = key,
+							tab = tab.tab,
+							amount = math.max(1, amount),
+						}
+						pcall(function()
+							data.color = itemName.BackgroundColor3
+						end)
+						cards[#cards + 1] = data
+						local existing = index[key]
+						if existing == nil then
+							index[key] = data
+						else
+							shared[key] = true
+							-- The Currents entry wins, because that is the tab the
+							-- Default Gun and Default Knife live in.
+							if existing.tab ~= CONFIG.KEEP_TAB and tab.tab == CONFIG.KEEP_TAB then
+								index[key] = data
 							end
 						end
 					end
@@ -870,85 +1074,53 @@ local function getFreshWeaponQueue()
 		end
 	end
 
-	-- True when a name is one of the items that must stay put: the Default Gun
-	-- and the Default Knife. The tab decides whether that applies at all.
-	local function isKeepName(label)
-		local name = tostring(label or ""):lower()
-		for _, keep in ipairs(CONFIG.KEEP_ITEM_NAMES) do
-			if name == keep or name:find(keep, 1, true) ~= nil then
-				return true
-			end
-		end
-		return false
-	end
-
-	for _, container in ipairs(paths.containers) do
-		scanContainerForData(container.node, container.tab)
-	end
-
-	for name in pairs(sharedLabels) do
-		if isKeepName(name) then
-			print("[Trade] note: '" .. tostring(name) .. "' also exists in another tab; treating it as the Currents one")
+	-- Said once, not on every read: the same note twenty times helps nobody.
+	for key in pairs(shared) do
+		if isKeepKey(key, false) and not sharedNoted[key] then
+			sharedNoted[key] = true
+			local label = index[key] and index[key].label or key
+			print("[Trade] note: '" .. tostring(label) .. "' also exists in another tab; treating it as the Currents one")
 		end
 	end
 
-	-- True for the handful of items that must stay where they are: the Default
-	-- Gun and Default Knife, and only in the Currents tab. An item with the
-	-- same name anywhere else is still traded.
-	local function isKept(itemData)
-		if itemData == nil or itemData.tab ~= CONFIG.KEEP_TAB then
-			return false
-		end
-		return isKeepName(itemData.label)
+	local okSalvage, salvageChildren = pcall(function()
+		return paths.salvage:GetChildren()
+	end)
+	if not okSalvage or salvageChildren == nil then
+		return nil, nil
 	end
 
 	local tier1, tier2, tier3 = {}, {}, {} -- 1: RGB(100,10,255)  2: RGB(255,0,179)  3: the rest
+	local kept, keptNames = 0, {}
+	local matched = {}
 
-	local keptCount = 0
-	local successSalvage, salvageChildren = pcall(function()
-		return paths.salvage:GetChildren()
-	end)
+	for _, frame in ipairs(salvageChildren) do
+		local frameName = tostring(frame.Name)
+		local data = matchItem(frameName, index, cards)
+		if data ~= nil then
+			matched[data.key] = true
+		end
 
-	if successSalvage and salvageChildren then
-		for _, salvageChild in ipairs(salvageChildren) do
-			local salvageFrameName = salvageChild.Name
-			local itemData = nil
-
-			for invName, data in pairs(inventoryDataMap) do
-				local firstWord = salvageFrameName:match("^([^_]+)") or salvageFrameName
-				if invName == salvageFrameName
-					or invName:sub(1, #firstWord) == firstWord
-					or salvageFrameName:find(invName, 1, true)
-				then
-					itemData = data
-					break
+		-- Kept: the Default Gun and Default Knife, in Currents. A frame the tabs
+		-- do not explain falls back to its own name, so a default that is not in
+		-- any tab is still never offered.
+		if isKeptItem(data) or (data == nil and isKeepKey(normalizeName(frameName), true)) then
+			kept = kept + (data and data.amount or 1)
+			keptNames[data and data.label or frameName] = true
+		else
+			local entry = { frameName = frameName, amount = data and data.amount or 1 }
+			local tier = tier3
+			if data ~= nil and data.color ~= nil then
+				local r = math.floor(data.color.R * 255 + 0.5)
+				local g = math.floor(data.color.G * 255 + 0.5)
+				local b = math.floor(data.color.B * 255 + 0.5)
+				if r == 100 and g == 10 and b == 255 then
+					tier = tier1
+				elseif r == 255 and g == 0 and b == 179 then
+					tier = tier2
 				end
 			end
-
-			if isKept(itemData) then
-				-- Left alone on purpose: not queued, so it is never offered.
-				keptCount = keptCount + (itemData.amount or 1)
-			else
-				local entry = {
-					frameName = salvageFrameName,
-					amount = itemData and itemData.amount or 1,
-				}
-
-				if itemData then
-					local r = math.floor(itemData.color.R * 255 + 0.5)
-					local g = math.floor(itemData.color.G * 255 + 0.5)
-					local b = math.floor(itemData.color.B * 255 + 0.5)
-					if r == 100 and g == 10 and b == 255 then
-						tier1[#tier1 + 1] = entry
-					elseif r == 255 and g == 0 and b == 179 then
-						tier2[#tier2 + 1] = entry
-					else
-						tier3[#tier3 + 1] = entry
-					end
-				else
-					tier3[#tier3 + 1] = entry
-				end
-			end
+			tier[#tier + 1] = entry
 		end
 	end
 
@@ -964,8 +1136,90 @@ local function getFreshWeaponQueue()
 			end
 		end
 	end
-	lastKeptCount = keptCount
-	return queue
+
+	-- Cards the salvage list did not show. Reported rather than traded: the
+	-- trade takes the salvaged name, and offering a name the trade does not know
+	-- would only waste a slot.
+	local unlisted, unlistedNames = 0, {}
+	for _, data in ipairs(cards) do
+		if not matched[data.key] and not isKeptItem(data) and unlistedNames[data.label] == nil then
+			unlistedNames[data.label] = true
+			unlisted = unlisted + 1
+		end
+	end
+
+	lastKeptCount = kept
+	lastKeptNames = keptNames
+	return queue, {
+		salvage = #salvageChildren,
+		tradable = #queue,
+		kept = kept,
+		unlisted = unlisted,
+		unlistedNames = unlistedNames,
+		tabs = #tabs,
+	}
+end
+
+local function keptNamesText(limit)
+	local names = {}
+	for name in pairs(lastKeptNames) do
+		names[#names + 1] = tostring(name)
+		if #names >= (limit or 6) then
+			break
+		end
+	end
+	if #names == 0 then
+		return "none found"
+	end
+	return table.concat(names, ", ")
+end
+
+-- An empty salvage read is not proof that the run is over: the game rebuilds
+-- that list, and a read can land while it is still filling in, which used to
+-- end a run with items still in the inventory. This keeps reading until the
+-- answer holds still:
+--   * a tradable item shows up            -> not over, hand it back
+--   * the tabs are readable and nothing
+--     in them or in the salvage is
+--     tradable, read the same way a few
+--     times in a row                      -> confirmed finished
+--   * the list keeps coming back with
+--     nothing in it, or the tabs still
+--     show items the salvage never lists  -> not confirmed; reported, never
+--                                            claimed as "all traded".
+local function waitForFinished()
+	local lastInfo = nil
+	local confirms = 0
+	local empties = 0
+	while state.running do
+		local queue, info = getFreshWeaponQueue()
+		if queue == nil then
+			empties = empties + 1
+			if empties > CONFIG.EMPTY_READ_ATTEMPTS then
+				return nil, lastInfo, false
+			end
+			print("[Trade] the inventory could not be read - reading again")
+			waitSeconds(CONFIG.EMPTY_READ_GAP_SECONDS)
+		elseif #queue > 0 then
+			return queue, info, false
+		else
+			lastInfo = info
+			if info ~= nil and info.tabs > 0 and info.unlisted == 0 then
+				confirms = confirms + 1
+				if confirms >= CONFIG.DONE_CONFIRM_ATTEMPTS then
+					return nil, info, true
+				end
+				waitSeconds(CONFIG.DONE_CONFIRM_GAP_SECONDS)
+			else
+				empties = empties + 1
+				if empties > CONFIG.EMPTY_READ_ATTEMPTS then
+					return nil, info, false
+				end
+				waitSeconds(CONFIG.EMPTY_READ_GAP_SECONDS)
+			end
+		end
+	end
+	return nil, lastInfo, false
 end
 
 --------------------------------------------------------------------------
@@ -1245,22 +1499,53 @@ local function runTradeLoop(targetPlayer, targetUsername)
 	end
 
 	while state.running do
-		local queue = getFreshWeaponQueue()
+		local queue, info = getFreshWeaponQueue()
 		if queue == nil then
 			error("the inventory could not be read")
 		end
 
-		local remaining = #queue
-		if remaining == 0 then
-			-- Everything tradable is gone. What is left on purpose is only the
-			-- Default Gun and Default Knife in Currents.
-			print(string.format(
-				"[Trade] nothing tradable left - every Events and Classic item and every other Currents item is gone. %d item(s) kept back (Default Gun / Default Knife).",
-				lastKeptCount
-			))
-			break
+		if #queue == 0 then
+			-- One empty read is not proof: the salvage list is rebuilt by the game
+			-- and used to come back empty while items were still there.
+			print("[Trade] nothing tradable in that read - double checking before stopping")
+			local again, againInfo, confirmed = waitForFinished()
+			if not state.running then
+				break
+			end
+			if againInfo ~= nil then
+				-- What the last read saw, including anything it could not offer.
+				info = againInfo
+			end
+			if again ~= nil and #again > 0 then
+				queue, info = again, againInfo
+				print("[Trade] good thing I checked: " .. tostring(#again) .. " item(s) are still tradable")
+			elseif confirmed then
+				print(string.format(
+					"[Trade] nothing tradable left - read the salvage and every tab again %d times and only the kept item(s) remain (%s).",
+					CONFIG.DONE_CONFIRM_ATTEMPTS,
+					keptNamesText()
+				))
+				break
+			else
+				print("[Trade] STOPPED WITHOUT CONFIRMING: the tabs and the salvage kept disagreeing.")
+				if info ~= nil and info.unlistedNames ~= nil then
+					local names = {}
+					for name in pairs(info.unlistedNames) do
+						names[#names + 1] = tostring(name)
+						if #names >= 8 then
+							break
+						end
+					end
+					if #names > 0 then
+						print("[Trade] still in the inventory but not in the salvage list: " .. table.concat(names, ", "))
+					end
+				end
+				print("[Trade] " .. tostring(lastKeptCount) .. " kept item(s): " .. keptNamesText())
+				break
+			end
 		end
 
+		local remaining = #queue
 		cycle = cycle + 1
 
 		local batch = {}
