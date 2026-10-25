@@ -606,28 +606,40 @@ local function tradeGui()
 	return gui:FindFirstChild("TradeGUI")
 end
 
-local function hideTradeGui()
-	local gui = tradeGui()
-	if gui ~= nil and gui.Enabled then
-		pcall(function()
-			gui.Enabled = false
-		end)
+-- Fires a button exactly once.
+--
+-- Firing both Activated and MouseButton1Click presses the trade's accept
+-- toggle twice, and the second press takes the accept back: the other player
+-- then sees the trade close as if it had been declined. When the executor can
+-- report signal connections, the signal the game actually listens to is used;
+-- otherwise Activated (the standard button release signal) is used.
+local function liveButtonSignal(button)
+	if type(getconnections) == "function" then
+		for _, name in ipairs({ "Activated", "MouseButton1Click" }) do
+			local ok, list = pcall(getconnections, button[name])
+			if ok and type(list) == "table" and #list > 0 then
+				return name
+			end
+		end
 	end
+	return "Activated"
 end
 
 local function fireButton(button)
 	if button == nil then
 		return false
 	end
+	local name = liveButtonSignal(button)
 	if type(firesignal) == "function" then
-		pcall(firesignal, button.Activated)
-		pcall(firesignal, button.MouseButton1Click)
-	else
-		pcall(function()
-			button.Activated:Fire()
-		end)
+		local ok = pcall(firesignal, button[name])
+		if ok then
+			return true, name
+		end
 	end
-	return true
+	local ok = pcall(function()
+		button[name]:Fire()
+	end)
+	return ok, name
 end
 
 local function pressAccept()
@@ -635,7 +647,6 @@ local function pressAccept()
 	if gui == nil then
 		return false, "the trade window is not open"
 	end
-	hideTradeGui()
 	local button = nil
 	pcall(function()
 		button = gui.Container.Trade.Actions.Accept.ActionButton
@@ -643,8 +654,8 @@ local function pressAccept()
 	if button == nil then
 		return false, "the accept button could not be found"
 	end
-	fireButton(button)
-	return true
+	local ok, signalName = fireButton(button)
+	return ok, signalName
 end
 
 local function pressConfirm()
@@ -659,8 +670,8 @@ local function pressConfirm()
 	if button == nil then
 		return false, "the confirm button could not be found"
 	end
-	fireButton(button)
-	return true
+	local ok, signalName = fireButton(button)
+	return ok, signalName
 end
 
 local function tradeRemote(name)
@@ -972,22 +983,13 @@ local function runTradeLoop(targetPlayer, targetUsername)
 
 		setStatus(string.format("Cycle %d: adding %d item(s)...", cycle, #batch), THEME.green)
 
-		local hiding = true
-		spawnThread(function()
-			while hiding and state.running do
-				hideTradeGui()
-				waitSeconds(0.1)
-			end
-		end)
-
+		-- The trade window is left alone here: it stays visible and enabled the
+		-- whole time, on both clients.
 		for _, itemName in ipairs(batch) do
 			offerItem(itemName)
 			print("[Trade] offered " .. tostring(itemName))
 			waitSeconds(CONFIG.ITEM_OFFER_GAP_SECONDS)
-		end
-		hiding = false
-
-		publishSync("items", targetUsername, cycle, tostring(#batch))
+		end		publishSync("items", targetUsername, cycle, tostring(#batch))
 		print(string.format(
 			"[Trade] all %d item(s) added; both sides accept in %ss",
 			#batch,
