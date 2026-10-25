@@ -706,9 +706,6 @@ end
 -- time and never twice, and the window itself is never touched by either
 -- script (no hiding, no disabling, no deleting).
 
--- Declared before the press code that calls it; filled in just below.
-local ensureTradeWindowShown
-
 --------------------------------------------------------------------------
 -- Pressing the trade buttons
 --
@@ -986,68 +983,12 @@ local function dumpTradeButtons(gui)
 	end
 end
 
--- The game itself sometimes switches this player's trade window off (Enabled
--- goes false) when the request is accepted. A switched-off window cannot be
--- accepted or confirmed - the button signals go nowhere, which is exactly the
--- "the host accepted but nothing happened" symptom. Nothing here ever switches
--- it off: this only ever turns it back on. Same code as the joiner's.
-local windowRestores = 0
-
-ensureTradeWindowShown = function()
-	local gui = tradeGui()
-	if gui == nil then
-		return false
-	end
-	local ok, enabled = pcall(function()
-		return gui.Enabled
-	end)
-	if ok and enabled ~= true then
-		local fixed = pcall(function()
-			gui.Enabled = true
-		end)
-		if fixed then
-			windowRestores = windowRestores + 1
-			print("[Trade] the trade window had been switched off (Enabled = false) - switched it back on")
-		end
-	end
-	return true
-end
-
--- Keeps the trade window switched on for the whole session, in a loop. It runs
--- the entire time, not only while a trade is open, because whatever switches
--- the window off can do it at any moment. Every pass sets Enabled = true;
--- nothing here ever sets it to false, hides anything or deletes anything.
-local SHOW_LOOP_SECONDS = 0.1
-
-local function startTradeWindowKeepAlive()
-	spawnThread(function()
-		while state ~= nil and state.running do
-			local gui = tradeGui()
-			if gui ~= nil then
-				local wasOff = false
-				pcall(function()
-					wasOff = gui.Enabled ~= true
-					gui.Enabled = true
-				end)
-				if wasOff then
-					windowRestores = windowRestores + 1
-					print("[Trade] the trade window was off - switched it back on (" .. tostring(windowRestores) .. ")")
-				end
-			end
-			waitSeconds(SHOW_LOOP_SECONDS)
-		end
-	end)
-end
-
-startTradeWindowKeepAlive()
-
 -- Presses accept and keeps pressing until the game shows it took it. The
 -- confirm page appearing, the accept button changing, or the window closing are
 -- the proof; a signal call on its own proves nothing. Same code as the joiner's.
 local function pressAccept()
 	local lastReason = "the trade window is not open"
 	for attempt = 1, ACCEPT_PRESS_ATTEMPTS do
-		ensureTradeWindowShown()
 		local gui = tradeGui()
 		if gui == nil then
 			return false, lastReason
@@ -1117,7 +1058,6 @@ end
 -- and keeps pressing until the page, or the whole window, is gone.
 local function pressConfirm()
 	for attempt = 1, CONFIRM_PRESS_TRIES do
-		ensureTradeWindowShown()
 		local gui = tradeGui()
 		if gui == nil then
 			print("[Trade] the trade window is closed - nothing left to confirm")
