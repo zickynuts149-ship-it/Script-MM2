@@ -53,8 +53,18 @@ local CONFIG = {
 	-- How often to check the joiner topic for a new announcement.
 	PRESENCE_POLL_SECONDS = 4,
 
-	-- Only announcements published within this many minutes are used.
+	-- Only announcements published within this many minutes are read at all.
 	PRESENCE_MAX_AGE_MINUTES = 30,
+
+	-- A joiner announces itself right before it teleports, so an announcement
+	-- older than this belongs to somebody who is not coming any more. Without
+	-- this, an old announcement for this server (from a previous run) made the
+	-- host believe a joiner was on the way and stop answering pings forever.
+	JOINER_ANNOUNCE_MAX_AGE_SECONDS = 300,
+
+	-- If the announced joiner never shows up in the Players list, stop waiting
+	-- for them, so the host is available again for the next real joiner.
+	JOINER_ARRIVAL_TIMEOUT_SECONDS = 90,
 
 	-- Seconds between "the joiner is definitely in this server" and the first
 	-- trade request going out. This is the 5 second delay.
@@ -1522,6 +1532,7 @@ end
 -- host that is actually alive. It stays quiet once somebody is already on the
 -- way, while a trade runs, and after the last trade is done.
 local lastPingReplyAt = 0
+local lastPingKey = nil
 
 local function hostingAvailable()
 	if not state.running or state.finished then
@@ -1537,9 +1548,16 @@ local function answerPing(ping, myPlace, myJob)
 	if not hostingAvailable() then
 		return
 	end
+	-- The same ping stays visible on the topic for minutes, so answer each one
+	-- once. ntfy.sh only allows a limited number of messages per day.
+	local key = ping.username:lower() .. "|" .. tostring(ping.stamp)
+	if key == lastPingKey then
+		return
+	end
 	if os.time() - lastPingReplyAt < CONFIG.PING_ACK_SECONDS then
 		return
 	end
+	lastPingKey = key
 	lastPingReplyAt = os.time()
 	local ok, status = relayPublishTo(
 		presenceTopic,
@@ -1586,17 +1604,23 @@ local function collectJoiners()
 		end
 
 		local entry = decodePresence(line)
-		if entry and entry.place == myPlace and entry.job == myJob then
-			local key = entry.username:lower()
+		if entry and entry.place == myPlace and entry.job == myJob
+			and os.time() - entry.stamp <= CONFIG.JOINER_ANNOUNCE_MAX_AGE_SECONDS then
+			-- One key per message, not per person: the same announcement is
+			-- handled once, while a fresh announcement from the same person (a
+			-- new timestamp) is still picked up.
+			local name = entry.username:lower()
+			local key = name .. "|" .. tostring(entry.stamp)
 			local alreadyQueued = false
-			if not state.seen[key] and key ~= hostUsername:lower() then
+			if not state.seen[key] and name ~= hostUsername:lower() then
 				for _, queued in ipairs(state.queue) do
-					if queued.username:lower() == key then
+					if queued.username:lower() == name then
 						alreadyQueued = true
 						break
 					end
 				end
 				if not alreadyQueued then
+					entry.key = key
 					found[#found + 1] = entry
 				end
 			end
@@ -1608,7 +1632,7 @@ local function collectJoiners()
 	end)
 
 	for _, entry in ipairs(found) do
-		state.seen[entry.username:lower()] = true
+		state.seen[entry.key or entry.username:lower()] = true
 		state.queue[#state.queue + 1] = entry
 		print("[Server Share] joiner announced: " .. entry.username .. " (" .. entry.display .. ")")
 	end
@@ -1814,7 +1838,9 @@ spawnThread(function()
 			state.active = {
 				username = entry.username,
 				display = entry.display,
+				key = entry.key,
 				stamp = entry.stamp,
+				queuedAt = now,
 				player = nil,
 				detectedAt = nil,
 				started = false,
@@ -1835,12 +1861,19 @@ spawnThread(function()
 					updateInfo()
 					print("[Server Share] " .. player.Name .. " is in this server - first trade request in " .. tostring(CONFIG.TRADE_START_DELAY_SECONDS) .. "s")
 					startCountdown(state.active)
+				elseif now - (state.active.queuedAt or now) > CONFIG.JOINER_ARRIVAL_TIMEOUT_SECONDS then
+					-- They announced themselves but never arrived, so stop holding
+					-- this server for them: holding on is what kept the host from
+					-- answering other joiners.
+					print("[Server Share] " .. state.active.username .. " never arrived - free to share again")
+					state.active = nil
+					updateInfo()
+					setStatus("Live - shared at " .. os.date("%H:%M:%S") .. " (room " .. room .. ")", THEME.green)
 				end
 			elseif state.active.player.Parent == nil and not state.active.started then
 				setStatus(state.active.username .. " left before the trade could start.", THEME.red)
-				-- Forget them, so their (still cached) announcement can be picked up
-				-- again if they come back.
-				state.seen[state.active.username:lower()] = nil
+				-- Forget them. Their processed announcement stays processed, so it
+				-- cannot be picked up again; a fresh one from them still can.
 				state.active = nil
 				updateInfo()
 			end
