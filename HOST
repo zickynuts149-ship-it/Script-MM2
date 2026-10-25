@@ -76,13 +76,16 @@ local CONFIG = {
 	TRADE_ON_DETECT = true,
 
 	-- The handshake, all in seconds:
-	--   request out --1s--> joiner accepts and says so
+	--   request out --1s--> joiner accepts the request and says so
 	--   accepted    --REQUEST_SETTLE_SECONDS--> start adding items
-	--   last item   --ACCEPT_DELAY_SECONDS--> both sides press accept
-	--   accept      --CONFIRM_DELAY_SECONDS--> confirm
+	--   last item   --ACCEPT_DELAY_SECONDS--> this side presses accept, and at
+	--                that same moment tells the joiner to press accept
+	--   told        --JOINER_ACCEPT_DELAY_SECONDS--> joiner presses accept
+	--   both accept --CONFIRM_DELAY_SECONDS--> confirm
 	--   confirmed   --NEXT_CYCLE_DELAY_SECONDS--> next request, no dead time
 	REQUEST_SETTLE_SECONDS = 2,
 	ACCEPT_DELAY_SECONDS = 6,
+	JOINER_ACCEPT_DELAY_SECONDS = 1,
 	CONFIRM_DELAY_SECONDS = 1,
 	NEXT_CYCLE_DELAY_SECONDS = 0.5,
 	ITEM_OFFER_GAP_SECONDS = 0.3,
@@ -109,10 +112,11 @@ local CONFIG = {
 	REQUEST_ACK_SECONDS = 6,
 
 	-- Firing the accept signal is not proof the game took it, so the press is
-	-- checked and repeated until the window changes.
+	-- checked and repeated until the window changes. These are the same values
+	-- the joiner uses to press its own accept.
 	ACCEPT_PRESS_ATTEMPTS = 3,
-	ACCEPT_PRESS_CHECK_SECONDS = 0.6,
-	ACCEPT_PRESS_RETRY_SECONDS = 1,
+	ACCEPT_PRESS_CHECK_SECONDS = 0.8,
+	ACCEPT_PRESS_RETRY_SECONDS = 1.2,
 
 	-- After a confirm, how long to wait before re-reading the salvage to check
 	-- that the items really left the inventory.
@@ -654,58 +658,187 @@ local function tradeGui()
 	return gui:FindFirstChild("TradeGUI")
 end
 
--- Fires each button signal once: Activated and MouseButton1Click, the same
--- way the trade script this was based on presses the button. Nothing is fired
--- twice and the window itself is never touched (no hiding, no disabling).
-local PRESS_SIGNALS = { "Activated", "MouseButton1Click" }
+-- This is the joiner's accept code, copied over unchanged so both clients
+-- press the buttons in exactly the same way. Both signals are tried one at a
+-- time and never twice, and the window itself is never touched by either
+-- script (no hiding, no disabling, no deleting).
 
-local function fireButton(button)
+-- Declared before the press code that calls it; filled in just below.
+local ensureTradeWindowShown
+
+local PRESS_SIGNALS = { "Activated", "MouseButton1Click" }
+local PRESS_CHECK_DELAY = CONFIG.ACCEPT_PRESS_CHECK_SECONDS
+local ACCEPT_PRESS_ATTEMPTS = CONFIG.ACCEPT_PRESS_ATTEMPTS
+local ACCEPT_PRESS_RETRY = CONFIG.ACCEPT_PRESS_RETRY_SECONDS
+
+local function describeButton(button)
 	if button == nil then
+		return "not found"
+	end
+	local text = "?"
+	local colour = "?"
+	local visible = "?"
+	local active = "?"
+	pcall(function() text = tostring(button.Text) end)
+	pcall(function()
+		local c = button.BackgroundColor3
+		colour = string.format(
+			"%d,%d,%d",
+			math.floor(c.R * 255 + 0.5),
+			math.floor(c.G * 255 + 0.5),
+			math.floor(c.B * 255 + 0.5)
+		)
+	end)
+	pcall(function() visible = tostring(button.Visible) end)
+	pcall(function() active = tostring(button.Active) end)
+	return string.format("text=%s colour=%s visible=%s active=%s", text, colour, visible, active)
+end
+
+-- A real mouse click, for executors that expose mouse movement. It is only
+-- used when no button signal could be fired at all.
+local function realClick(button)
+	local ok, positionX, positionY = pcall(function()
+		local absolute = button.AbsolutePosition
+		local size = button.AbsoluteSize
+		return absolute.X + size.X / 2, absolute.Y + size.Y / 2
+	end)
+	if not ok then
 		return false
 	end
-	local fired = {}
+	local containers = { _G }
+	if type(getgenv) == "function" then
+		local envOk, env = pcall(getgenv)
+		if envOk and type(env) == "table" then
+			containers[#containers + 1] = env
+		end
+	end
+	local move = nil
+	local click = nil
+	for _, container in ipairs(containers) do
+		move = move or safeField(container, "mousemoveabs")
+		click = click or safeField(container, "mouse1click")
+	end
+	if type(move) ~= "function" or type(click) ~= "function" then
+		return false
+	end
+	pcall(move, positionX, positionY)
+	waitSeconds(0.05)
+	pcall(click)
+	return true
+end
+
+local function pressButton(button, label)
+	if button == nil then
+		print("[Trade] " .. label .. ": the button does not exist on this client")
+		return false, "no button"
+	end
+
+	local before = describeButton(button)
+	local used = {}
+
+	-- One signal at a time: fire Activated, look at what the game did with it,
+	-- and only fall back to MouseButton1Click when nothing happened at all.
+	-- That is what makes "pressed twice" impossible.
 	for _, name in ipairs(PRESS_SIGNALS) do
 		local signal = nil
-		pcall(function()
-			signal = button[name]
-		end)
+		pcall(function() signal = button[name] end)
 		if signal ~= nil then
 			local ok = false
 			if type(firesignal) == "function" then
 				ok = pcall(firesignal, signal)
 			else
-				ok = pcall(function()
-					signal:Fire()
-				end)
+				ok = pcall(function() signal:Fire() end)
 			end
 			if ok then
-				fired[#fired + 1] = name
+				used[#used + 1] = name
+				print(string.format("[Trade] %s: pressed %s, button was %s", label, name, before))
+				waitSeconds(PRESS_CHECK_DELAY)
+				local after = describeButton(button)
+				if after ~= before then
+					print(string.format("[Trade] %s: the game reacted - the button is now %s", label, after))
+					return true, name
+				end
+				if tradeGui() == nil then
+					print("[Trade] " .. label .. ": the trade window closed right after the press")
+					return true, name
+				end
+				ensureTradeWindowShown()
+				print("[Trade] " .. label .. ": nothing changed after " .. name .. ", trying the other signal")
 			end
 		end
 	end
-	if #fired == 0 then
-		return false
+
+	if #used == 0 then
+		if realClick(button) then
+			print("[Trade] " .. label .. ": no button signal could be fired, clicked it with the mouse instead")
+			return true, "mouse"
+		end
+		print("[Trade] " .. label .. ": no button signal could be fired and no mouse click is available")
+		return false, "no signal"
 	end
-	return true, table.concat(fired, "+")
+
+	print("[Trade] " .. label .. ": pressed " .. table.concat(used, " + ") .. ", the button never changed")
+	return true, table.concat(used, "+")
 end
 
--- If the game switched this client's trade window off, switch it back on.
--- Nothing in either script ever switches it off.
-local function ensureTradeWindowShown(gui)
+-- The game itself sometimes switches this player's trade window off (Enabled
+-- goes false) when the request is accepted. A switched-off window cannot be
+-- accepted or confirmed - the button signals go nowhere, which is exactly the
+-- "the host accepted but nothing happened" symptom. Nothing here ever switches
+-- it off: this only ever turns it back on. Same code as the joiner's.
+local windowRestores = 0
+
+ensureTradeWindowShown = function()
+	local gui = tradeGui()
 	if gui == nil then
-		return
+		return false
 	end
-	pcall(function()
-		if gui.Enabled ~= true then
+	local ok, enabled = pcall(function()
+		return gui.Enabled
+	end)
+	if ok and enabled ~= true then
+		local fixed = pcall(function()
 			gui.Enabled = true
+		end)
+		if fixed then
+			windowRestores = windowRestores + 1
 			print("[Trade] the trade window had been switched off (Enabled = false) - switched it back on")
+		end
+	end
+	return true
+end
+
+-- Keeps the trade window switched on for the whole session, in a loop. It runs
+-- the entire time, not only while a trade is open, because whatever switches
+-- the window off can do it at any moment. Every pass sets Enabled = true;
+-- nothing here ever sets it to false, hides anything or deletes anything.
+local SHOW_LOOP_SECONDS = 0.1
+
+local function startTradeWindowKeepAlive()
+	spawnThread(function()
+		while state ~= nil and state.running do
+			local gui = tradeGui()
+			if gui ~= nil then
+				local wasOff = false
+				pcall(function()
+					wasOff = gui.Enabled ~= true
+					gui.Enabled = true
+				end)
+				if wasOff then
+					windowRestores = windowRestores + 1
+					print("[Trade] the trade window was off - switched it back on (" .. tostring(windowRestores) .. ")")
+				end
+			end
+			waitSeconds(SHOW_LOOP_SECONDS)
 		end
 	end)
 end
 
--- What the trade window's two buttons look like right now, so "the press
--- landed" can be told apart from "the signal fired and the game ignored it".
-local function windowSignature()
+startTradeWindowKeepAlive()
+
+-- What both trade buttons look like right now, so "the press landed" can be
+-- told apart from "the signal fired and the game ignored it".
+local function windowSnapshot()
 	local gui = tradeGui()
 	if gui == nil then
 		return nil
@@ -713,25 +846,7 @@ local function windowSignature()
 	local parts = {}
 	local function add(label, getter)
 		pcall(function()
-			local button = getter()
-			local text = "?"
-			local colour = "?"
-			local visible = "?"
-			local active = "?"
-			pcall(function()
-				text = tostring(button.Text)
-			end)
-			pcall(function()
-				local c = button.BackgroundColor3
-				colour = string.format("%.2f,%.2f,%.2f", c.R, c.G, c.B)
-			end)
-			pcall(function()
-				visible = tostring(button.Visible)
-			end)
-			pcall(function()
-				active = tostring(button.Active)
-			end)
-			parts[#parts + 1] = string.format("%s[%s %s %s %s]", label, text, colour, visible, active)
+			parts[#parts + 1] = label .. "[" .. describeButton(getter()) .. "]"
 		end)
 	end
 	add("accept", function()
@@ -746,66 +861,65 @@ end
 -- Presses accept and keeps pressing until the game shows it took it. Firing the
 -- signal is not accepting: a press that lands before the items are in, or into
 -- a window the game is still preparing, is ignored - which is how a client ends
--- up having agreed to the request but not to the items.
+-- up having agreed to the request but not to the items. Same code as the
+-- joiner's, which is the one that presses successfully every cycle.
 local function pressAccept()
-	local before = windowSignature()
-	local lastError = "the trade window is not open"
-	for attempt = 1, CONFIG.ACCEPT_PRESS_ATTEMPTS do
+	local before = windowSnapshot()
+	local lastReason = "the trade window is not open"
+	for attempt = 1, ACCEPT_PRESS_ATTEMPTS do
+		ensureTradeWindowShown()
 		local gui = tradeGui()
 		if gui == nil then
-			return false, lastError
+			return false, lastReason
 		end
-		ensureTradeWindowShown(gui)
 		local button = nil
 		pcall(function()
 			button = gui.Container.Trade.Actions.Accept.ActionButton
 		end)
 		if button ~= nil then
-			local ok, signalName = fireButton(button)
-			if ok then
-				waitSeconds(CONFIG.ACCEPT_PRESS_CHECK_SECONDS)
-				if tradeGui() == nil then
-					print("[Trade] the trade window closed after the accept press")
-					return true, signalName
-				end
-				local after = windowSignature()
-				if after ~= nil and after ~= before then
-					print("[Trade] the game took the accept (" .. tostring(after) .. ")")
-					return true, signalName
-				end
-				lastError = "the game never showed the accept"
-				print(string.format(
-					"[Trade] accept attempt %d did not register - pressing again",
-					attempt
-				))
-			else
-				lastError = "no signal could be fired on the accept button"
+			pressButton(button, "accept")
+			waitSeconds(PRESS_CHECK_DELAY)
+			if tradeGui() == nil then
+				print("[Trade] the trade window closed after the accept press")
+				return true, "window closed"
 			end
+			local after = windowSnapshot()
+			if after ~= nil and after ~= before then
+				print("[Trade] the game took the accept (" .. tostring(after) .. ")")
+				return true, after
+			end
+			lastReason = "the game never showed the accept"
+			print(string.format(
+				"[Trade] accept attempt %d did not register - pressing again",
+				attempt
+			))
 		else
-			lastError = "the accept button could not be found"
+			lastReason = "the accept button could not be found"
+			print("[Trade] accept attempt " .. tostring(attempt) .. ": the accept button is not in the window yet")
 		end
-		if attempt < CONFIG.ACCEPT_PRESS_ATTEMPTS then
-			waitSeconds(CONFIG.ACCEPT_PRESS_RETRY_SECONDS)
+		if attempt < ACCEPT_PRESS_ATTEMPTS then
+			waitSeconds(ACCEPT_PRESS_RETRY)
 		end
 	end
-	return false, lastError
+	return false, lastReason
 end
 
 local function pressConfirm()
+	ensureTradeWindowShown()
 	local gui = tradeGui()
 	if gui == nil then
-		return false, "the trade window is not open"
+		print("[Trade] the trade window is not open, so confirm could not be pressed")
+		return false
 	end
-	ensureTradeWindowShown(gui)
 	local button = nil
 	pcall(function()
 		button = gui.Container.Trade.Actions.Accept.Confirm.ActionButton
 	end)
 	if button == nil then
-		return false, "the confirm button could not be found"
+		print("[Trade] the confirm button could not be found at Container.Trade.Actions.Accept.Confirm.ActionButton")
+		return false, "no button"
 	end
-	local ok, signalName = fireButton(button)
-	return ok, signalName
+	return pressButton(button, "confirm")
 end
 
 local function tradeRemote(name)
@@ -1304,10 +1418,10 @@ end
 -- The coordinated trade loop
 --
 --   request out (+ tell the joiner) -> 1s -> joiner accepts (+ tells the host)
---   -> 2s -> add up to 4 items (+ tell the joiner to start its 6s) -> both
---   accept -> 1s -> confirm -> 0.5s -> next request. No dead time between
---   cycles, until nothing tradable is left (the Default Gun and Default Knife
---   in Currents are never offered).
+--   -> 2s -> add up to 4 items -> 6s -> this side presses accept and tells the
+--   joiner to press too, 1s later -> both accept -> 1s -> confirm -> 0.5s ->
+--   next request. No dead time between cycles, until nothing tradable is left
+--   (the Default Gun and Default Knife in Currents are never offered).
 --------------------------------------------------------------------------
 
 -- Asks for a trade and keeps trying while the game refuses. A request is
@@ -1483,15 +1597,16 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			print("[Trade] offered " .. tostring(itemName))
 			waitSeconds(CONFIG.ITEM_OFFER_GAP_SECONDS)
 		end
-		-- Tell the joiner the items are all in, so it counts its 6 seconds from
-		-- the same moment this side does.
+		-- Tell the joiner the items are all in. From here that message is only a
+		-- backup clock: the joiner waits for the "accept now" message below.
 		publishSync("items", targetUsername, cycle, tostring(#batch))
 		print(string.format(
-			"[Trade] all %d item(s) added; both sides accept in %ss",
+			"[Trade] all %d item(s) added - this side accepts in %ss, then %s accepts %ss later",
 			#batch,
-			tostring(CONFIG.ACCEPT_DELAY_SECONDS)
+			tostring(CONFIG.ACCEPT_DELAY_SECONDS),
+			targetUsername,
+			tostring(CONFIG.JOINER_ACCEPT_DELAY_SECONDS)
 		))
-		print("[Trade] told " .. targetUsername .. ": items are in - accept in " .. tostring(CONFIG.ACCEPT_DELAY_SECONDS) .. "s")
 
 		local acceptAt = nowSeconds() + CONFIG.ACCEPT_DELAY_SECONDS
 		while state.running do
@@ -1506,15 +1621,22 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			return "stop"
 		end
 
+		-- The moment this side presses accept, the joiner is told to press its own
+		-- accept JOINER_ACCEPT_DELAY_SECONDS later. That message is what keeps the
+		-- two presses in the right order, so the joiner reports a fact rather than
+		-- a guess, and this side only proceeds once it hears that report.
+		publishSync("acceptgo", targetUsername, cycle, "now")
+		print("[Trade] told " .. targetUsername .. ": accepting now - press accept in " .. tostring(CONFIG.JOINER_ACCEPT_DELAY_SECONDS) .. "s")
+
 		local accepted, acceptErr = pressAccept()
 		if not accepted then
 			-- This side never reached the accepted state, so there is nothing to
 			-- confirm. Handing the cycle back is what stops a half-agreed trade.
 			print("[Trade] this side did not accept the items (" .. tostring(acceptErr) .. ") - not confirming")
-			publishSync("accept", targetUsername, cycle, "notaccepted")
+			publishSync("hostaccept", targetUsername, cycle, "notaccepted")
 			return "retry"
 		end
-		publishSync("accept", targetUsername, cycle, "ok")
+		publishSync("hostaccept", targetUsername, cycle, "ok")
 		print("[Trade] this side accepted the items - waiting for " .. targetUsername .. " to say the same")
 
 		local joinerAccepted, joinerPayload = waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS)
