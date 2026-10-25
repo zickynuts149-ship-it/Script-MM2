@@ -1,0 +1,1857 @@
+--[[
+	Server Share - HOST (with automatic trade)
+
+	Run this in the Roblox server you want someone to join.
+
+	What it does
+	  1. Publishes this server's PlaceId / JobId plus your own name to a tiny
+	     public relay (ntfy.sh), so joiner.lua can find and teleport here.
+	  2. Listens on a second topic ("<server topic>_players") where the joiner
+	     announces itself. That is how this script learns the joiner's username
+	     before the joiner has even finished loading in. It also answers the
+	     joiner's "is anybody hosting?" ping there, but only while it really is
+	     free to host, so a finished host cannot attract anyone.
+	  3. Watches the actual Players list until that username is really in this
+	     server, waits CONFIG.TRADE_START_DELAY_SECONDS (5 s), sends it a trade
+	     request and only adds its up to four items once the joiner has
+	     confirmed its trade window is open. Both clients press accept 6 s after
+	     the items are in. A refused request is retried instead of ending the
+	     loop, and a trade that moves nothing is noticed and retried. It repeats
+	     until only CONFIG.STOP_AT_REMAINING items are left, then stops for good.
+
+	The timing and the accept/confirm handshake travel over a third topic
+	("<server topic>_sync"), so host and joiner wait for each other instead of
+	only guessing from timers. The joiner's half lives in joiner.lua.
+
+	The card in the corner shows the host name, the job id and the joiner, and
+	has a Stop button, so the person running this stays in control.
+
+	Read the notes next to this file for setup and limits.
+]]
+
+--------------------------------------------------------------------------
+-- Configuration
+--------------------------------------------------------------------------
+
+local CONFIG = {
+	-- Both scripts must use the same room code. Change it to a private code.
+	ROOM = "fbshare1",
+
+	-- Message relay. ntfy.sh needs no signup.
+	RELAY_URL = "https://ntfy.sh",
+
+	-- Republish this often even if nothing changed, so the joiner can tell the
+	-- info is fresh. ntfy.sh allows 250 messages/day; 10 minutes stays under it.
+	HEARTBEAT_SECONDS = 600,
+
+	-- How often to notice that the server changed (e.g. after a game teleport).
+	CHECK_SECONDS = 3,
+
+	-- Seconds before retrying after a failed publish.
+	RETRY_SECONDS = 20,
+
+	-- How often to check the joiner topic for a new announcement.
+	PRESENCE_POLL_SECONDS = 4,
+
+	-- Only announcements published within this many minutes are used.
+	PRESENCE_MAX_AGE_MINUTES = 30,
+
+	-- Seconds between "the joiner is definitely in this server" and the first
+	-- trade request going out. This is the 5 second delay.
+	TRADE_START_DELAY_SECONDS = 5,
+
+	-- true  -> the trade loop starts by itself after TRADE_START_DELAY_SECONDS.
+	-- false -> you press "Run trade" yourself once the joiner is in.
+	TRADE_ON_DETECT = true,
+
+	-- The handshake, all in seconds:
+	--   request out --REQUEST_SETTLE_SECONDS--> start adding items
+	--   last item    --ACCEPT_DELAY_SECONDS--> both sides press accept
+	--   accept       --CONFIRM_DELAY_SECONDS--> confirm
+	--   confirm      --NEXT_CYCLE_DELAY_SECONDS--> next request
+	REQUEST_SETTLE_SECONDS = 5,
+	ACCEPT_DELAY_SECONDS = 6,
+	CONFIRM_DELAY_SECONDS = 1,
+	NEXT_CYCLE_DELAY_SECONDS = 5,
+	ITEM_OFFER_GAP_SECONDS = 0.3,
+
+	-- How long to wait for the other side's event on the sync topic.
+	ACK_WAIT_SECONDS = 15,
+
+	-- How often the sync topic is read while a trade is running.
+	SYNC_POLL_SECONDS = 2,
+
+	-- Liveness handshake. A joiner that is looking for a host publishes a ping
+	-- on the joiner topic; this script answers it only while it really is
+	-- hosting. That way an old announcement from a server that is long gone (or
+	-- from this very client) can never attract anyone.
+	PING_ACK_SECONDS = 6,      -- minimum gap between two answers
+	PING_MAX_AGE_SECONDS = 120, -- ignore pings older than this
+
+	-- The game refuses a new request while a trade is open and for a moment
+	-- after one, so a failed request is retried instead of ending the loop.
+	REQUEST_ATTEMPTS = 4,
+	REQUEST_RETRY_SECONDS = 4,
+
+	-- How long to wait for the joiner to confirm the trade is live on its side.
+	REQUEST_ACK_SECONDS = 10,
+
+	-- After a confirm, how long to wait before re-reading the salvage to check
+	-- that the items really left the inventory.
+	TRADE_SETTLE_SECONDS = 3,
+
+	-- How many cycles in a row may trade nothing before the loop gives up and
+	-- says why, instead of pretending to work.
+	MAX_EMPTY_CYCLES = 3,
+
+	-- How many items go into one trade, and how many may be left behind when
+	-- the loop stops. With STOP_AT_REMAINING = 2 the last two items stay put.
+	MAX_ITEMS_PER_TRADE = 4,
+	STOP_AT_REMAINING = 2,
+}
+
+--------------------------------------------------------------------------
+-- Services and small helpers
+--------------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+
+local localPlayer = Players.LocalPlayer
+
+local function waitSeconds(seconds)
+	if task and task.wait then
+		return task.wait(seconds)
+	end
+	return wait(seconds)
+end
+
+local function spawnThread(fn)
+	if task and task.spawn then
+		return task.spawn(fn)
+	end
+	return spawn(fn)
+end
+
+-- Wall clock in seconds, used for the countdown.
+local function nowSeconds()
+	if type(tick) == "function" then
+		return tick()
+	end
+	return os.clock()
+end
+
+local function safeField(container, key)
+	if container == nil then
+		return nil
+	end
+	if type(container) ~= "table" and typeof(container) ~= "Instance" and type(container) ~= "userdata" then
+		return nil
+	end
+	local ok, value = pcall(function()
+		return container[key]
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+-- Removes control characters, separators and runs of spaces, so a name can
+-- never break the wire format or the layout.
+local function cleanText(text, maxLength)
+	if type(text) ~= "string" then
+		return ""
+	end
+	text = text:gsub("[%c]", " ")
+	text = text:gsub("|", "/")
+	text = text:gsub("%s+", " ")
+	text = text:gsub("^%s+", "")
+	text = text:gsub("%s+$", "")
+	if maxLength and #text > maxLength then
+		text = text:sub(1, maxLength - 1) .. "..."
+	end
+	return text
+end
+
+local function toHex(text)
+	return (tostring(text):gsub(".", function(char)
+		return string.format("%02x", string.byte(char))
+	end))
+end
+
+--------------------------------------------------------------------------
+-- HTTP bridge (executors expose this under different names)
+--------------------------------------------------------------------------
+
+local function urlEncode(value)
+	return (tostring(value):gsub("[^%w%-%._~]", function(char)
+		return string.format("%%%02X", string.byte(char))
+	end))
+end
+
+local httpRequest
+for _, candidate in ipairs({
+	safeField(syn, "request"),
+	safeField(http, "request"),
+	safeField(fluxus, "request"),
+	safeField(krnl, "request"),
+	rawget(_G, "http_request"),
+	rawget(_G, "request"),
+}) do
+	if type(candidate) == "function" then
+		httpRequest = candidate
+		break
+	end
+end
+
+-- Returns: ok (boolean, HTTP 2xx), status code, body
+local function http(url, method, body, headers)
+	if httpRequest then
+		local sent, response = pcall(httpRequest, {
+			Url = url,
+			Method = method or "GET",
+			Headers = headers or {},
+			Body = body,
+		})
+		if not sent then
+			return false, 0, tostring(response)
+		end
+		if type(response) == "string" then
+			-- Older shims hand back the body directly.
+			return true, 200, response
+		end
+		if type(response) ~= "table" then
+			return false, 0, "unexpected executor response"
+		end
+		local status = tonumber(response.StatusCode or response.Status or response.status or response.statusCode or response.code) or 0
+		local responseBody = response.Body or response.body or ""
+		if type(responseBody) ~= "string" then
+			responseBody = tostring(responseBody)
+		end
+		return status >= 200 and status < 300, status, responseBody
+	end
+
+	-- Fallback for executors that only shim game:HttpGet (GET requests only).
+	if method == nil or method == "GET" then
+		local ok, response = pcall(function()
+			return game:HttpGet(url)
+		end)
+		if ok and type(response) == "string" then
+			return true, 200, response
+		end
+		return false, 0, tostring(response)
+	end
+
+	return false, 0, "this executor does not support HTTP requests"
+end
+
+local httpAvailable = httpRequest ~= nil
+if not httpAvailable then
+	local ok, getter = pcall(function()
+		return game.HttpGet
+	end)
+	httpAvailable = ok and type(getter) == "function"
+end
+
+--------------------------------------------------------------------------
+-- Room / wire format
+--------------------------------------------------------------------------
+
+local WIRE_VERSION = "v2"        -- what this script publishes
+local PRESENCE_VERSION = "j1"    -- what joiner.lua publishes
+
+local function sanitizeRoom(raw)
+	local cleaned = tostring(raw or ""):lower():gsub("[^%w_%-]", "")
+	if #cleaned > 48 then
+		cleaned = cleaned:sub(1, 48)
+	end
+	if cleaned == "" then
+		cleaned = "main"
+	end
+	return cleaned
+end
+
+local room = sanitizeRoom(CONFIG.ROOM)
+local topic = "fbshare_" .. room
+local presenceTopic = topic .. "_players"
+local relayBase = tostring(CONFIG.RELAY_URL):gsub("/+$", "")
+
+-- v2|placeId|jobId|username|displayName|gameName|timestamp
+local function encodeInfo(place, job, username, displayName, gameName, timestamp)
+	return table.concat({
+		WIRE_VERSION,
+		tostring(place),
+		cleanText(tostring(job), 100),
+		cleanText(tostring(username), 40),
+		cleanText(tostring(displayName), 40),
+		cleanText(tostring(gameName), 60),
+		tostring(timestamp),
+	}, "|")
+end
+
+-- j1|placeId|jobId|username|displayName|timestamp
+local function decodePresence(text)
+	if type(text) ~= "string" then
+		return nil
+	end
+	local parts = {}
+	for part in (text .. "|"):gmatch("([^|]*)|") do
+		parts[#parts + 1] = part
+	end
+	if #parts ~= 6 or parts[1] ~= PRESENCE_VERSION then
+		return nil
+	end
+
+	local place = tonumber(parts[2])
+	local job = parts[3]
+	local stamp = tonumber(parts[6])
+	local username = cleanText(parts[4], 40)
+
+	if not place or place <= 0 or math.floor(place) ~= place then
+		return nil
+	end
+	if type(job) ~= "string" or #job < 6 or #job > 100 or job:find("[^%w%-_%.]") then
+		return nil
+	end
+	if not stamp then
+		return nil
+	end
+	-- The joiner topic is public, so only accept something that looks like a
+	-- real Roblox username before it can ever become a trade target.
+	if username == "" or #username > 25 or username:find("[^%w_]") then
+		return nil
+	end
+
+	return {
+		place = place,
+		job = job,
+		username = username,
+		display = cleanText(parts[5], 40),
+		stamp = stamp,
+	}
+end
+
+-- q1|placeId|username|timestamp
+--
+-- A joiner that has not found a host yet puts one of these on the joiner
+-- topic, asking "is anybody actually hosting right now?". It is deliberately
+-- a different version string from a joiner announcement, so it can never be
+-- mistaken for somebody who is coming to this server.
+local QUERY_VERSION = "q1"
+
+local function decodeQuery(text)
+	if type(text) ~= "string" then
+		return nil
+	end
+	local parts = {}
+	for part in (text .. "|"):gmatch("([^|]*)|") do
+		parts[#parts + 1] = part
+	end
+	if #parts ~= 4 or parts[1] ~= QUERY_VERSION then
+		return nil
+	end
+
+	local place = tonumber(parts[2])
+	local stamp = tonumber(parts[4])
+	local username = cleanText(parts[3], 40)
+
+	if not place or place <= 0 or not stamp then
+		return nil
+	end
+	if username == "" or #username > 25 or username:find("[^%w_]") then
+		return nil
+	end
+
+	return {
+		place = place,
+		username = username,
+		stamp = stamp,
+	}
+end
+
+-- h1|placeId|jobId|username|displayName|gameName|timestamp
+--
+-- The answer to a ping: "a host is running here, right now, in this job".
+-- Decoded by joiner.lua before it follows anybody.
+local ACK_VERSION = "h1"
+
+local function encodeAck(place, job, username, displayName, gameName, timestamp)
+	return table.concat({
+		ACK_VERSION,
+		tostring(place),
+		cleanText(tostring(job), 100),
+		cleanText(tostring(username), 40),
+		cleanText(tostring(displayName), 40),
+		cleanText(tostring(gameName), 60),
+		tostring(timestamp),
+	}, "|")
+end
+
+local function relayPublishTo(topicName, text)
+	if httpRequest then
+		local ok, status, body = http(relayBase .. "/" .. topicName, "POST", text, {
+			["Content-Type"] = "text/plain",
+		})
+		return ok, status, body
+	end
+	-- GET publish, for the game:HttpGet-only fallback.
+	local ok, status, body = http(relayBase .. "/" .. topicName .. "/publish?message=" .. urlEncode(text), "GET")
+	return ok, status, body
+end
+
+local function relayPublish(text)
+	return relayPublishTo(topic, text)
+end
+
+local function currentJobId()
+	local ok, job = pcall(function()
+		return game.JobId
+	end)
+	if ok and type(job) == "string" then
+		return job
+	end
+	return ""
+end
+
+--------------------------------------------------------------------------
+-- Talking to the joiner while the trade runs
+--
+-- A third topic, "<server topic>_sync", carries what each side just did: the
+-- request went out, the items are in, accept was pressed. Both scripts wait
+-- for the other side's event instead of only guessing from a timer, and every
+-- event names the host and the joiner it belongs to, so two pairs sharing a
+-- room never react to each other's messages.
+--------------------------------------------------------------------------
+
+local syncTopic = topic .. "_sync"
+local SYNC_VERSION = "s1"
+
+-- Filled in further down. The trade code is defined before the UI and the
+-- state table, so it needs the names up front and assigns to them there.
+local ui, state, setStatus, updateInfo, THEME
+
+local function relayReadTopic(topicName, minutes)
+	local url = relayBase .. "/" .. topicName .. "/raw?poll=1&since=" .. tostring(minutes) .. "m"
+	return http(url, "GET")
+end
+
+-- s1|event|placeId|jobId|cycle|payload|hostUsername|joinerUsername|timestamp
+local function encodeSync(event, joinerUsername, cycle, payload)
+	return table.concat({
+		SYNC_VERSION,
+		cleanText(tostring(event), 16),
+		tostring(tonumber(game.PlaceId) or 0),
+		cleanText(currentJobId(), 100),
+		tostring(tonumber(cycle) or 0),
+		cleanText(tostring(payload or ""), 60),
+		cleanText(tostring(localPlayer.Name or ""), 40),
+		cleanText(tostring(joinerUsername or ""), 40),
+		tostring(os.time()),
+	}, "|")
+end
+
+local function decodeSync(text)
+	if type(text) ~= "string" then
+		return nil
+	end
+	local parts = {}
+	for part in (text .. "|"):gmatch("([^|]*)|") do
+		parts[#parts + 1] = part
+	end
+	if #parts ~= 9 or parts[1] ~= SYNC_VERSION then
+		return nil
+	end
+
+	local place = tonumber(parts[3])
+	local job = parts[4]
+	local cycle = tonumber(parts[5])
+	local stamp = tonumber(parts[9])
+
+	if not place or place <= 0 then
+		return nil
+	end
+	if type(job) ~= "string" or #job < 6 or #job > 100 or job:find("[^%w%-_%.]") then
+		return nil
+	end
+	if not cycle or not stamp then
+		return nil
+	end
+
+	return {
+		event = cleanText(parts[2], 16),
+		place = place,
+		job = job,
+		cycle = cycle,
+		payload = cleanText(parts[6], 60),
+		host = cleanText(parts[7], 40),
+		joiner = cleanText(parts[8], 40),
+		stamp = stamp,
+	}
+end
+
+local function publishSync(event, joinerUsername, cycle, payload)
+	local ok, status = relayPublishTo(syncTopic, encodeSync(event, joinerUsername, cycle, payload))
+	if not ok then
+		print("[Trade] could not publish '" .. tostring(event) .. "' (error " .. tostring(status) .. ")")
+	end
+	return ok
+end
+
+--------------------------------------------------------------------------
+-- The joiner's side of the conversation
+--------------------------------------------------------------------------
+
+local sync = {
+	started = false,
+	busy = false,
+	events = {},
+}
+
+local function recordSync(entry)
+	local current = sync.events[entry.event]
+	if current == nil or entry.cycle >= current.cycle then
+		sync.events[entry.event] = entry
+	end
+end
+
+local function pollSync(myJob, joinerUsername)
+	if sync.busy then
+		return
+	end
+	sync.busy = true
+	local ok, status, body = relayReadTopic(syncTopic, 10)
+	sync.busy = false
+
+	if not ok then
+		if status == 429 then
+			waitSeconds(5)
+		end
+		return
+	end
+
+	local myPlace = tonumber(game.PlaceId) or 0
+	local wantedHost = tostring(localPlayer.Name or ""):lower()
+	local wantedJoiner = tostring(joinerUsername):lower()
+	local seen = {}
+
+	for line in tostring(body):gmatch("[^\r\n]+") do
+		local entry = decodeSync(line)
+		if entry
+			and entry.place == myPlace
+			and entry.job == myJob
+			and entry.host:lower() == wantedHost
+			and entry.joiner:lower() == wantedJoiner
+		then
+			local key = entry.event .. "#" .. tostring(entry.stamp)
+			if not seen[key] then
+				seen[key] = true
+				recordSync(entry)
+			end
+		end
+	end
+end
+
+local function startSyncPolling(joinerUsername)
+	if sync.started then
+		return
+	end
+	sync.started = true
+	local myJob = currentJobId()
+	spawnThread(function()
+		while state ~= nil and state.running do
+			pollSync(myJob, joinerUsername)
+			waitSeconds(CONFIG.SYNC_POLL_SECONDS)
+		end
+	end)
+end
+
+-- Waits until the joiner has reported `event` for `cycle`.
+local function waitForSync(event, cycle, timeoutSeconds)
+	local deadline = nowSeconds() + timeoutSeconds
+	while state ~= nil and state.running do
+		local entry = sync.events[event]
+		if entry ~= nil and entry.cycle >= cycle then
+			return true
+		end
+		if nowSeconds() >= deadline then
+			return false
+		end
+		waitSeconds(0.25)
+	end
+	return false
+end
+
+--------------------------------------------------------------------------
+-- Trade actions on this client
+--------------------------------------------------------------------------
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local function tradeGui()
+	local gui = localPlayer:FindFirstChild("PlayerGui")
+	if gui == nil then
+		return nil
+	end
+	return gui:FindFirstChild("TradeGUI")
+end
+
+local function hideTradeGui()
+	local gui = tradeGui()
+	if gui ~= nil and gui.Enabled then
+		pcall(function()
+			gui.Enabled = false
+		end)
+	end
+end
+
+local function fireButton(button)
+	if button == nil then
+		return false
+	end
+	if type(firesignal) == "function" then
+		pcall(firesignal, button.Activated)
+		pcall(firesignal, button.MouseButton1Click)
+	else
+		pcall(function()
+			button.Activated:Fire()
+		end)
+	end
+	return true
+end
+
+local function pressAccept()
+	local gui = tradeGui()
+	if gui == nil then
+		return false, "the trade window is not open"
+	end
+	hideTradeGui()
+	local button = nil
+	pcall(function()
+		button = gui.Container.Trade.Actions.Accept.ActionButton
+	end)
+	if button == nil then
+		return false, "the accept button could not be found"
+	end
+	fireButton(button)
+	return true
+end
+
+local function pressConfirm()
+	local gui = tradeGui()
+	if gui == nil then
+		return false, "the trade window is not open"
+	end
+	local button = nil
+	pcall(function()
+		button = gui.Container.Trade.Actions.Accept.Confirm.ActionButton
+	end)
+	if button == nil then
+		return false, "the confirm button could not be found"
+	end
+	fireButton(button)
+	return true
+end
+
+local function tradeRemote(name)
+	local ok, remote = pcall(function()
+		local container = ReplicatedStorage:WaitForChild("Trade", 10)
+		if container == nil then
+			return nil
+		end
+		return container:WaitForChild(name, 10)
+	end)
+	if ok then
+		return remote
+	end
+	return nil
+end
+
+local function sendTradeRequest(targetPlayer)
+	local remote = tradeRemote("SendRequest")
+	if remote == nil then
+		return false, "Trade.SendRequest could not be found"
+	end
+	local ok, err = pcall(function()
+		remote:InvokeServer(targetPlayer)
+	end)
+	if not ok then
+		return false, tostring(err)
+	end
+	return true
+end
+
+local function offerItem(itemName)
+	local remote = tradeRemote("OfferItem")
+	if remote == nil then
+		return false
+	end
+	return pcall(function()
+		remote:FireServer(itemName, "Weapons")
+	end)
+end
+
+--------------------------------------------------------------------------
+-- Reading the salvage / inventory
+--
+-- Same tiers, same stack expansion and same container paths as your trade
+-- script; only the target and the timing changed.
+--------------------------------------------------------------------------
+
+local tradePaths = nil
+
+local function resolveTradePaths()
+	if tradePaths ~= nil then
+		return tradePaths
+	end
+	local ok, paths = pcall(function()
+		local gui = localPlayer:WaitForChild("PlayerGui", 10)
+		local main = gui:WaitForChild("MainGUI", 15)
+		local gameGui = main:WaitForChild("Game", 15)
+		local inventory = gameGui:WaitForChild("Inventory"):WaitForChild("Main")
+			:WaitForChild("Weapons"):WaitForChild("Items"):WaitForChild("Container")
+		local salvage = gameGui:WaitForChild("Crafting"):WaitForChild("Inventory")
+			:WaitForChild("Salvage"):WaitForChild("ScrollFrame"):WaitForChild("Container")
+		local holiday = inventory:WaitForChild("Holiday"):WaitForChild("Container")
+		return {
+			inventory = inventory,
+			salvage = salvage,
+			containers = {
+				holiday:WaitForChild("Halloween"):WaitForChild("Container"),
+				holiday:WaitForChild("Christmas"):WaitForChild("Container"),
+				inventory:WaitForChild("Current"):WaitForChild("Container"),
+				inventory:WaitForChild("Classic"):WaitForChild("Container"),
+			},
+		}
+	end)
+	if ok and paths ~= nil then
+		tradePaths = paths
+	end
+	return tradePaths
+end
+
+local function shuffleTable(list)
+	for i = #list, 2, -1 do
+		local j = math.random(i)
+		list[i], list[j] = list[j], list[i]
+	end
+end
+
+pcall(function()
+	math.randomseed(tick())
+end)
+
+local function getFreshWeaponQueue()
+	local paths = resolveTradePaths()
+	if paths == nil then
+		return nil
+	end
+
+	local inventoryDataMap = {}
+
+	local function scanContainerForData(container)
+		local success, children = pcall(function()
+			return container:GetChildren()
+		end)
+		if not success or not children then
+			return
+		end
+		for _, child in ipairs(children) do
+			if child.Name == "NewItem" then
+				local itemName = child:FindFirstChild("ItemName")
+				if itemName then
+					local label = itemName:FindFirstChild("Label")
+					if label and label:IsA("TextLabel") then
+						local colorSuccess, bgColor = pcall(function()
+							return itemName.BackgroundColor3
+						end)
+						local amountNum = 1
+						local containerChild = child:FindFirstChild("Container")
+						local amountObj = containerChild and containerChild:FindFirstChild("Amount")
+						if amountObj then
+							local extractedNumber = tostring(amountObj.Text or ""):match("%d+")
+							if extractedNumber then
+								amountNum = tonumber(extractedNumber) or 1
+							end
+						end
+						if colorSuccess and bgColor then
+							inventoryDataMap[label.Text] = {
+								color = bgColor,
+								amount = amountNum,
+							}
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for _, container in ipairs(paths.containers) do
+		scanContainerForData(container)
+	end
+
+	local tier1, tier2, tier3 = {}, {}, {} -- 1: RGB(100,10,255)  2: RGB(255,0,179)  3: the rest
+
+	local successSalvage, salvageChildren = pcall(function()
+		return paths.salvage:GetChildren()
+	end)
+
+	if successSalvage and salvageChildren then
+		for _, salvageChild in ipairs(salvageChildren) do
+			local salvageFrameName = salvageChild.Name
+			local itemData = nil
+
+			for invName, data in pairs(inventoryDataMap) do
+				local firstWord = salvageFrameName:match("^([^_]+)") or salvageFrameName
+				if invName == salvageFrameName
+					or invName:sub(1, #firstWord) == firstWord
+					or salvageFrameName:find(invName, 1, true)
+				then
+					itemData = data
+					break
+				end
+			end
+
+			local entry = {
+				frameName = salvageFrameName,
+				amount = itemData and itemData.amount or 1,
+			}
+
+			if itemData then
+				local r = math.floor(itemData.color.R * 255 + 0.5)
+				local g = math.floor(itemData.color.G * 255 + 0.5)
+				local b = math.floor(itemData.color.B * 255 + 0.5)
+				if r == 100 and g == 10 and b == 255 then
+					tier1[#tier1 + 1] = entry
+				elseif r == 255 and g == 0 and b == 179 then
+					tier2[#tier2 + 1] = entry
+				else
+					tier3[#tier3 + 1] = entry
+				end
+			else
+				tier3[#tier3 + 1] = entry
+			end
+		end
+	end
+
+	shuffleTable(tier1)
+	shuffleTable(tier2)
+	shuffleTable(tier3)
+
+	local queue = {}
+	for _, tier in ipairs({ tier1, tier2, tier3 }) do
+		for _, item in ipairs(tier) do
+			for _ = 1, item.amount do
+				queue[#queue + 1] = item.frameName
+			end
+		end
+	end
+	return queue
+end
+
+--------------------------------------------------------------------------
+-- The coordinated trade loop
+--
+--   request out -> joiner confirms its window is open -> 5s -> add up to 4
+--   items -> 6s -> both accept -> confirm -> check the items really left the
+--   salvage -> 5s -> next request, until only STOP_AT_REMAINING are left.
+--------------------------------------------------------------------------
+
+-- Asks for a trade and keeps trying while the game refuses. A request is
+-- refused while another trade is still open and for a moment after one, which
+-- used to end the whole loop on the second cycle.
+local function requestTrade(targetPlayer, targetUsername, cycle)
+	local lastError = nil
+	for attempt = 1, CONFIG.REQUEST_ATTEMPTS do
+		if not state.running then
+			return false, "stopped"
+		end
+		if targetPlayer == nil or targetPlayer.Parent == nil then
+			return false, targetUsername .. " left the server"
+		end
+
+		local ok, err = sendTradeRequest(targetPlayer)
+		if ok then
+			publishSync("req", targetUsername, cycle, tostring(attempt))
+			print(string.format("[Trade] request sent to %s (attempt %d)", targetUsername, attempt))
+			return true
+		end
+
+		lastError = err
+		print(string.format("[Trade] request attempt %d failed: %s", attempt, tostring(err)))
+		setStatus(string.format(
+			"Cycle %d: the request was refused (%s). Retrying in %ds...",
+			cycle,
+			tostring(err),
+			CONFIG.REQUEST_RETRY_SECONDS
+		), THEME.amber)
+		waitSeconds(CONFIG.REQUEST_RETRY_SECONDS)
+	end
+	return false, lastError
+end
+
+-- How many of the items we just offered are still sitting in the salvage.
+-- A trade that really went through takes them out of it, so this is the honest
+-- answer to "did anything actually get traded?".
+local function countStillInQueue(batch, queue)
+	local present = {}
+	for _, name in ipairs(queue or {}) do
+		local key = tostring(name):lower()
+		present[key] = (present[key] or 0) + 1
+	end
+	local left = 0
+	for _, name in ipairs(batch) do
+		local key = tostring(name):lower()
+		if (present[key] or 0) > 0 then
+			present[key] = present[key] - 1
+			left = left + 1
+		end
+	end
+	return left
+end
+
+local function runTradeLoop(targetPlayer, targetUsername)
+	if resolveTradePaths() == nil then
+		error("the inventory and salvage containers could not be found")
+	end
+
+	local cycle = 0
+	local traded = 0
+	local emptyCycles = 0
+
+	startSyncPolling(targetUsername)
+
+	-- One full round trip. "ok" means the items left the inventory, "retry"
+	-- means this trade did not happen at all, "stop" means the script is done.
+	local function runCycle(batch)
+		setStatus(string.format("Cycle %d: sending %s a trade request...", cycle, targetUsername), THEME.green)
+		updateInfo()
+
+		local requested, requestError = requestTrade(targetPlayer, targetUsername, cycle)
+		if not requested then
+			if tostring(requestError) == "stopped" then
+				return "stop"
+			end
+			setStatus(
+				string.format("Cycle %d: the trade request could not be sent (%s).", cycle, tostring(requestError)),
+				THEME.red
+			)
+			return "retry"
+		end
+
+		-- The 5 second wait counts from the request that actually went through,
+		-- not from a refused attempt before it.
+		local cycleStartedAt = nowSeconds()
+
+		-- The joiner answers as soon as its own trade window is open, which is
+		-- the proof that the request landed. Without that proof the items were
+		-- offered into a trade that did not exist yet and nothing was added.
+		if waitForSync("reqok", cycle, CONFIG.REQUEST_ACK_SECONDS) then
+			print("[Trade] " .. targetUsername .. " has the trade window open")
+		else
+			print("[Trade] " .. targetUsername .. " has not confirmed the window yet - adding items anyway")
+		end
+		if not state.running then
+			return "stop"
+		end
+
+		local settle = CONFIG.REQUEST_SETTLE_SECONDS - (nowSeconds() - cycleStartedAt)
+		if settle > 0 then
+			waitSeconds(settle)
+		end
+
+		setStatus(string.format("Cycle %d: adding %d item(s)...", cycle, #batch), THEME.green)
+
+		local hiding = true
+		spawnThread(function()
+			while hiding and state.running do
+				hideTradeGui()
+				waitSeconds(0.1)
+			end
+		end)
+
+		for _, itemName in ipairs(batch) do
+			offerItem(itemName)
+			print("[Trade] offered " .. tostring(itemName))
+			waitSeconds(CONFIG.ITEM_OFFER_GAP_SECONDS)
+		end
+		hiding = false
+
+		publishSync("items", targetUsername, cycle, tostring(#batch))
+		print(string.format(
+			"[Trade] all %d item(s) added; both sides accept in %ss",
+			#batch,
+			tostring(CONFIG.ACCEPT_DELAY_SECONDS)
+		))
+
+		local acceptAt = nowSeconds() + CONFIG.ACCEPT_DELAY_SECONDS
+		while state.running do
+			local left = acceptAt - nowSeconds()
+			if left <= 0 then
+				break
+			end
+			setStatus(string.format("Cycle %d: accepting in %ss...", cycle, tostring(math.ceil(left))), THEME.green)
+			waitSeconds(math.min(1, left))
+		end
+		if not state.running then
+			return "stop"
+		end
+
+		local accepted, acceptErr = pressAccept()
+		publishSync("accept", targetUsername, cycle, accepted and "ok" or tostring(acceptErr))
+		if not accepted then
+			print("[Trade] could not press accept: " .. tostring(acceptErr))
+		end
+
+		if waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS) then
+			setStatus(string.format("Cycle %d: %s accepted too - confirming.", cycle, targetUsername), THEME.green)
+		else
+			setStatus(string.format(
+				"Cycle %d: %s did not report its accept in time - confirming anyway.",
+				cycle,
+				targetUsername
+			), THEME.amber)
+		end
+
+		waitSeconds(CONFIG.CONFIRM_DELAY_SECONDS)
+
+		local confirmed, confirmErr = pressConfirm()
+		publishSync("confirm", targetUsername, cycle, confirmed and "ok" or tostring(confirmErr))
+		if not confirmed then
+			print("[Trade] could not press confirm: " .. tostring(confirmErr))
+		end
+		waitForSync("confirm", cycle, CONFIG.ACK_WAIT_SECONDS)
+
+		waitSeconds(CONFIG.TRADE_SETTLE_SECONDS)
+
+		local after = getFreshWeaponQueue()
+		local left = #batch
+		if after ~= nil then
+			left = countStillInQueue(batch, after)
+		end
+		local moved = #batch - left
+
+		if moved <= 0 then
+			emptyCycles = emptyCycles + 1
+			print(string.format(
+				"[Trade] cycle %d traded nothing: all %d item(s) are still in the salvage",
+				cycle,
+				#batch
+			))
+			return "retry"
+		end
+
+		emptyCycles = 0
+		traded = traded + moved
+		print(string.format(
+			"=== Trade cycle %d complete: %d item(s) traded, %d in total ===",
+			cycle,
+			moved,
+			traded
+		))
+		return "ok"
+	end
+
+	while state.running do
+		local queue = getFreshWeaponQueue()
+		if queue == nil then
+			error("the inventory could not be read")
+		end
+
+		local remaining = #queue
+		if remaining <= CONFIG.STOP_AT_REMAINING then
+			print(string.format(
+				"[Trade] only %d item(s) left, which is at the stop limit of %d. Stopping here.",
+				remaining,
+				CONFIG.STOP_AT_REMAINING
+			))
+			break
+		end
+
+		cycle = cycle + 1
+
+		local batch = {}
+		for i = 1, math.min(CONFIG.MAX_ITEMS_PER_TRADE, remaining) do
+			batch[#batch + 1] = queue[i]
+		end
+
+		print(string.format(
+			"=== Trade cycle %d: %d item(s) this trade, %d in the salvage ===",
+			cycle,
+			#batch,
+			remaining
+		))
+
+		local outcome = runCycle(batch)
+
+		if outcome == "stop" then
+			break
+		elseif outcome == "retry" then
+			cycle = cycle - 1
+			if emptyCycles >= CONFIG.MAX_EMPTY_CYCLES then
+				error(string.format(
+					"the last %d trades moved nothing - the items are not reaching the trade window",
+					emptyCycles
+				))
+			end
+			-- A trade that just closed needs a moment before the next request.
+			waitSeconds(CONFIG.NEXT_CYCLE_DELAY_SECONDS)
+		else
+			waitSeconds(CONFIG.NEXT_CYCLE_DELAY_SECONDS)
+		end
+	end
+
+	publishSync("done", targetUsername, cycle, tostring(traded))
+	print(string.format("[Trade] finished after %d cycle(s), %d item(s) traded.", cycle, traded))
+	return true
+end
+
+--------------------------------------------------------------------------
+-- UI
+--------------------------------------------------------------------------
+
+THEME = {
+	bg = Color3.fromRGB(16, 17, 22),
+	panel = Color3.fromRGB(25, 27, 34),
+	line = Color3.fromRGB(46, 50, 62),
+	text = Color3.fromRGB(233, 236, 242),
+	soft = Color3.fromRGB(146, 152, 167),
+	muted = Color3.fromRGB(108, 113, 126),
+	accent = Color3.fromRGB(106, 141, 255),
+	green = Color3.fromRGB(80, 208, 138),
+	amber = Color3.fromRGB(240, 186, 84),
+	red = Color3.fromRGB(240, 106, 106),
+}
+
+local function create(class, props, children)
+	local instance = Instance.new(class)
+	if props then
+		for key, value in pairs(props) do
+			if key ~= "Parent" then
+				instance[key] = value
+			end
+		end
+	end
+	if children then
+		for _, child in ipairs(children) do
+			child.Parent = instance
+		end
+	end
+	if props and props.Parent then
+		instance.Parent = props.Parent
+	end
+	return instance
+end
+
+local function corner(parent, radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius), Parent = parent })
+end
+
+local function stroke(parent, color)
+	return create("UIStroke", {
+		Color = color,
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = parent,
+	})
+end
+
+local function resolveGuiParent()
+	if type(gethui) == "function" then
+		local ok, container = pcall(gethui)
+		if ok and typeof(container) == "Instance" then
+			return container
+		end
+	end
+	local ok, core = pcall(function()
+		return game:GetService("CoreGui")
+	end)
+	if ok and core then
+		return core
+	end
+	return localPlayer:WaitForChild("PlayerGui")
+end
+
+local function destroyPrevious()
+	for _, name in ipairs({ "ServerShareHost", "ServerShareJoiner" }) do
+		local ok = pcall(function()
+			local core = game:GetService("CoreGui")
+			local old = core:FindFirstChild(name)
+			if old then
+				old:Destroy()
+			end
+		end)
+		if not ok then
+			break
+		end
+	end
+	pcall(function()
+		local gui = localPlayer:FindFirstChild("PlayerGui")
+		if gui then
+			for _, name in ipairs({ "ServerShareHost", "ServerShareJoiner" }) do
+				local old = gui:FindFirstChild(name)
+				if old then
+					old:Destroy()
+				end
+			end
+		end
+	end)
+end
+
+local function buildUI()
+	destroyPrevious()
+
+	local gui = create("ScreenGui", {
+		Name = "ServerShareHost",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 50,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		Parent = resolveGuiParent(),
+	})
+
+	local card = create("Frame", {
+		Name = "Card",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -16, 0, 16),
+		Size = UDim2.fromOffset(320, 216),
+		BackgroundColor3 = THEME.panel,
+		BorderSizePixel = 0,
+		Parent = gui,
+	})
+	corner(card, 12)
+	stroke(card, THEME.line)
+
+	local header = create("TextButton", {
+		Name = "Header",
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = card,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, -24, 1, 0),
+		Position = UDim2.fromOffset(14, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = THEME.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "SHARING + AUTO TRADE",
+		Parent = header,
+	})
+
+	local dot = create("Frame", {
+		Name = "Dot",
+		Position = UDim2.new(1, -20, 0, 12),
+		Size = UDim2.fromOffset(8, 8),
+		BackgroundColor3 = THEME.amber,
+		BorderSizePixel = 0,
+		Parent = card,
+	})
+	corner(dot, 99)
+
+	local infoLabel = create("TextLabel", {
+		Name = "Info",
+		Position = UDim2.fromOffset(14, 34),
+		Size = UDim2.new(1, -28, 0, 84),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Code,
+		TextSize = 11,
+		TextColor3 = THEME.soft,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true,
+		Text = "Reading server info...",
+		Parent = card,
+	})
+
+	local statusLabel = create("TextLabel", {
+		Name = "Status",
+		Position = UDim2.fromOffset(14, 120),
+		Size = UDim2.new(1, -28, 0, 42),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 11,
+		TextColor3 = THEME.amber,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true,
+		Text = "Starting...",
+		Parent = card,
+	})
+
+	local stopButton = create("TextButton", {
+		Name = "Stop",
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0, 14, 1, -12),
+		Size = UDim2.fromOffset(84, 24),
+		BackgroundColor3 = THEME.panel,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 11,
+		TextColor3 = THEME.soft,
+		Text = "Stop",
+		Parent = card,
+	})
+	corner(stopButton, 6)
+	stroke(stopButton, THEME.line)
+
+	local tradeButton = create("TextButton", {
+		Name = "Trade",
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0, 106, 1, -12),
+		Size = UDim2.fromOffset(94, 24),
+		BackgroundColor3 = THEME.panel,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 11,
+		TextColor3 = THEME.soft,
+		Text = "Run trade",
+		Parent = card,
+	})
+	corner(tradeButton, 6)
+	stroke(tradeButton, THEME.line)
+
+	local copyButton = create("TextButton", {
+		Name = "Copy",
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -14, 1, -12),
+		Size = UDim2.fromOffset(96, 24),
+		BackgroundColor3 = THEME.panel,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 11,
+		TextColor3 = THEME.soft,
+		Text = "Copy Job ID",
+		Parent = card,
+	})
+	corner(copyButton, 6)
+	stroke(copyButton, THEME.line)
+
+	-- Drag from the header.
+	local dragging = false
+	local dragStart, startPosition
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPosition = card.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			card.Position = UDim2.new(
+				startPosition.X.Scale,
+				startPosition.X.Offset + delta.X,
+				startPosition.Y.Scale,
+				startPosition.Y.Offset + delta.Y
+			)
+		end
+	end)
+
+	return {
+		gui = gui,
+		card = card,
+		dot = dot,
+		info = infoLabel,
+		status = statusLabel,
+		stop = stopButton,
+		trade = tradeButton,
+		copy = copyButton,
+	}
+end
+
+ui = buildUI()
+
+--------------------------------------------------------------------------
+-- Who is running this script
+--------------------------------------------------------------------------
+
+local gameName = cleanText(tostring(game.Name or ""), 60)
+if gameName == "" then
+	gameName = "Unknown game"
+end
+
+-- This is the name the joiner sees on its card.
+local hostDisplay = cleanText(tostring(localPlayer.DisplayName or localPlayer.Name or ""), 40)
+if hostDisplay == "" then
+	hostDisplay = "Unknown player"
+end
+
+-- This is the exact Roblox username, and the one other scripts should match.
+local hostUsername = cleanText(tostring(localPlayer.Name or ""), 40)
+if hostUsername == "" then
+	hostUsername = "Unknown player"
+end
+
+local placeId = tonumber(game.PlaceId) or 0
+
+--------------------------------------------------------------------------
+-- State
+--------------------------------------------------------------------------
+
+state = {
+	running = true,
+	-- server info publishing
+	lastSentAt = 0,
+	lastAttemptAt = 0,
+	lastOk = false,
+	sentCount = 0,
+	lastJob = nil,
+	-- joiner tracking
+	seen = {},        -- lowercased username -> true once it has been queued
+	queue = {},       -- announcements waiting to be matched to a player
+	active = nil,     -- { username, display, stamp, player, detectedAt, started }
+	tradeStarted = false,
+	tradeRunning = false,
+	tradeTarget = nil,
+	finished = false, -- every trade is done; stop advertising this server
+}
+
+setStatus = function(text, color)
+	ui.status.Text = text
+	ui.status.TextColor3 = color
+	ui.dot.BackgroundColor3 = color
+end
+
+updateInfo = function()
+	local job = currentJobId()
+	local place = tonumber(game.PlaceId) or placeId
+	local lines = {
+		"Host: " .. hostDisplay .. " (@" .. hostUsername .. ")",
+		"Game: " .. gameName,
+		"Place: " .. tostring(place),
+		"Job: " .. (job == "" and "not available yet" or job),
+	}
+
+	if state.finished and state.tradeTarget then
+		lines[#lines + 1] = "Joiner: " .. state.tradeTarget .. " (finished)"
+	elseif state.tradeRunning and state.tradeTarget then
+		lines[#lines + 1] = "Joiner: " .. state.tradeTarget .. " (trade running)"
+	elseif state.active then
+		if state.active.player then
+			lines[#lines + 1] = "Joiner: " .. state.active.player.Name .. " (in server)"
+		else
+			lines[#lines + 1] = "Joiner: " .. state.active.username .. " (coming)"
+		end
+	elseif #state.queue > 0 then
+		lines[#lines + 1] = "Joiner: " .. state.queue[1].username .. " (coming)"
+	else
+		lines[#lines + 1] = "Joiner: waiting"
+	end
+
+	ui.info.Text = table.concat(lines, "\n")
+end
+
+--------------------------------------------------------------------------
+-- Running the coordinated trade loop with the joiner
+--------------------------------------------------------------------------
+
+local function runTrade(targetPlayer, targetUsername)
+	if state.tradeStarted then
+		setStatus("The trade loop is already running for " .. tostring(state.tradeTarget) .. ".", THEME.amber)
+		return false
+	end
+
+	if targetPlayer == nil or targetPlayer.Parent == nil then
+		setStatus("That player is not in this server any more.", THEME.red)
+		return false
+	end
+
+	state.tradeStarted = true
+	state.tradeTarget = targetUsername
+	ui.trade.Text = "Trading..."
+	print("[Server Share] starting the coordinated trade loop with " .. targetUsername)
+
+	spawnThread(function()
+		local ok, result = pcall(runTradeLoop, targetPlayer, targetUsername)
+		if not ok then
+			state.tradeStarted = false
+			state.tradeRunning = false
+			state.tradeTarget = nil
+			ui.trade.Text = "Run trade"
+			print("[Server Share] trade loop stopped: " .. tostring(result))
+			setStatus("Trade loop stopped: " .. tostring(result), THEME.red)
+			updateInfo()
+			return
+		end
+
+		state.tradeRunning = false
+		state.finished = true
+		ui.trade.Text = "Finished"
+		setStatus(
+			"Done. Traded down to the last " .. tostring(CONFIG.STOP_AT_REMAINING) .. " item(s); this server is no longer advertised.",
+			THEME.green
+		)
+		updateInfo()
+	end)
+
+	updateInfo()
+	setStatus("Trading with " .. targetUsername .. " now.", THEME.green)
+	return true
+end
+
+--------------------------------------------------------------------------
+-- Finding the joiner in this server
+--------------------------------------------------------------------------
+
+-- Only the exact Roblox username is trusted, because that same string ends up
+-- as the trade target. Display names are only shown, never matched.
+local function findPlayerByUsername(username)
+	local wanted = tostring(username):lower()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= localPlayer and player.Name:lower() == wanted then
+			return player
+		end
+	end
+	return nil
+end
+
+-- Answers "is anybody hosting right now?", so a joiner only ever follows a
+-- host that is actually alive. It stays quiet once somebody is already on the
+-- way, while a trade runs, and after the last trade is done.
+local lastPingReplyAt = 0
+
+local function hostingAvailable()
+	if not state.running or state.finished then
+		return false
+	end
+	if state.tradeStarted or state.tradeRunning or state.active ~= nil then
+		return false
+	end
+	return #state.queue == 0
+end
+
+local function answerPing(ping, myPlace, myJob)
+	if not hostingAvailable() then
+		return
+	end
+	if os.time() - lastPingReplyAt < CONFIG.PING_ACK_SECONDS then
+		return
+	end
+	lastPingReplyAt = os.time()
+	local ok, status = relayPublishTo(
+		presenceTopic,
+		encodeAck(myPlace, myJob, hostUsername, hostDisplay, gameName, os.time())
+	)
+	if ok then
+		print("[Server Share] " .. ping.username .. " asked for a host - told them this server is live")
+	else
+		print("[Server Share] could not answer " .. ping.username .. " (error " .. tostring(status) .. ")")
+	end
+end
+
+local function collectJoiners()
+	local myJob = currentJobId()
+	if myJob == "" then
+		return
+	end
+
+	local url = relayBase .. "/" .. presenceTopic .. "/raw?poll=1&since=" .. tostring(CONFIG.PRESENCE_MAX_AGE_MINUTES) .. "m"
+	local ok, status, body = http(url, "GET")
+	if not ok then
+		if status == 429 then
+			print("[Server Share] joiner topic is rate limiting this network")
+		else
+			print("[Server Share] could not read the joiner topic (error " .. tostring(status) .. ")")
+		end
+		return
+	end
+
+	local myPlace = tonumber(game.PlaceId) or 0
+	local found = {}
+	local newestPing = nil
+
+	for line in tostring(body):gmatch("[^\r\n]+") do
+		local query = decodeQuery(line)
+		if query then
+			if query.username:lower() ~= hostUsername:lower()
+				and os.time() - query.stamp <= CONFIG.PING_MAX_AGE_SECONDS
+				then
+				if newestPing == nil or query.stamp > newestPing.stamp then
+					newestPing = query
+				end
+			end
+		end
+
+		local entry = decodePresence(line)
+		if entry and entry.place == myPlace and entry.job == myJob then
+			local key = entry.username:lower()
+			local alreadyQueued = false
+			if not state.seen[key] and key ~= hostUsername:lower() then
+				for _, queued in ipairs(state.queue) do
+					if queued.username:lower() == key then
+						alreadyQueued = true
+						break
+					end
+				end
+				if not alreadyQueued then
+					found[#found + 1] = entry
+				end
+			end
+		end
+	end
+
+	table.sort(found, function(a, b)
+		return a.stamp < b.stamp
+	end)
+
+	for _, entry in ipairs(found) do
+		state.seen[entry.username:lower()] = true
+		state.queue[#state.queue + 1] = entry
+		print("[Server Share] joiner announced: " .. entry.username .. " (" .. entry.display .. ")")
+	end
+
+	if #found > 0 then
+		updateInfo()
+	end
+
+	if newestPing ~= nil then
+		answerPing(newestPing, myPlace, myJob)
+	end
+end
+
+local function startCountdown(active)
+	spawnThread(function()
+		local total = CONFIG.TRADE_START_DELAY_SECONDS
+		while state.running and state.active == active and not active.started do
+			local remaining = total - (nowSeconds() - active.detectedAt)
+			if remaining <= 0 then
+				break
+			end
+			if active.player == nil or active.player.Parent == nil then
+				return
+			end
+			setStatus(string.format(
+				"%s is in the server. Sending the first trade request in %d...",
+				active.player.Name,
+				math.ceil(remaining)
+			), THEME.green)
+			waitSeconds(math.min(1, math.max(0.1, remaining)))
+		end
+
+		if not state.running or state.active ~= active or active.started then
+			return
+		end
+		if active.player == nil or active.player.Parent == nil then
+			setStatus(active.username .. " left before the trade could start.", THEME.red)
+			state.active = nil
+			updateInfo()
+			return
+		end
+
+		active.started = true
+		if CONFIG.TRADE_ON_DETECT then
+			runTrade(active.player, active.player.Name)
+		else
+			setStatus(active.player.Name .. " is in the server. Press Run trade to start.", THEME.green)
+		end
+	end)
+end
+
+--------------------------------------------------------------------------
+-- Share loop (server info)
+--------------------------------------------------------------------------
+
+local function publish()
+	if state.finished then
+		-- Everything has been traded, so this server should not attract a new
+		-- joiner any more. The card stays, the advertising stops.
+		return true
+	end
+
+	local job = currentJobId()
+	local place = tonumber(game.PlaceId) or placeId
+
+	if job == "" then
+		updateInfo()
+		setStatus("This client did not expose a Job ID. Rejoin the server and run the script again.", THEME.red)
+		return false
+	end
+
+	if state.lastJob ~= nil and job ~= state.lastJob then
+		-- The server changed, so anything announced for the old one no longer counts.
+		state.queue = {}
+		state.seen = {}
+		state.active = nil
+		updateInfo()
+	end
+
+	local payload = encodeInfo(place, job, hostUsername, hostDisplay, gameName, os.time())
+	local ok, status = relayPublish(payload)
+	state.lastAttemptAt = os.time()
+	state.lastOk = ok
+
+	if ok then
+		state.sentCount = state.sentCount + 1
+		state.lastSentAt = os.time()
+		state.lastJob = job
+		updateInfo()
+		if not state.active and not state.tradeStarted then
+			setStatus("Live - shared at " .. os.date("%H:%M:%S") .. " (room " .. room .. ")", THEME.green)
+		else
+			ui.dot.BackgroundColor3 = THEME.green
+		end
+		return true
+	end
+
+	if status == 429 then
+		setStatus("Relay is rate limiting this network. Will retry shortly.", THEME.amber)
+	else
+		setStatus("Could not reach the relay (error " .. tostring(status) .. "). Retrying...", THEME.red)
+	end
+	return false
+end
+
+--------------------------------------------------------------------------
+-- Buttons
+--------------------------------------------------------------------------
+
+ui.stop.MouseButton1Click:Connect(function()
+	state.running = false
+	ui.gui:Destroy()
+	print("[Server Share] stopped sharing room '" .. room .. "'")
+end)
+
+ui.trade.MouseButton1Click:Connect(function()
+	if state.tradeStarted then
+		setStatus("The trade script is already running for " .. tostring(state.tradeTarget) .. ".", THEME.amber)
+		return
+	end
+	if state.active and state.active.player then
+		state.active.started = true
+		runTrade(state.active.player, state.active.player.Name)
+		return
+	end
+	if state.active then
+		setStatus(state.active.username .. " has announced this server but is not in it yet.", THEME.amber)
+		return
+	end
+	if #state.queue > 0 then
+		setStatus(state.queue[1].username .. " has announced this server but is not in it yet.", THEME.amber)
+		return
+	end
+	setStatus("No joiner has announced this server yet.", THEME.amber)
+end)
+
+ui.copy.MouseButton1Click:Connect(function()
+	local job = currentJobId()
+	if job == "" then
+		return
+	end
+	local copied = false
+	local environment = type(getgenv) == "function" and getgenv() or _G
+	for _, name in ipairs({ "setclipboard", "toclipboard" }) do
+		local fn = rawget(environment, name)
+		if type(fn) == "function" then
+			local ok = pcall(fn, job)
+			copied = copied or ok
+		end
+	end
+	ui.copy.Text = copied and "Copied" or "Copy failed"
+	waitSeconds(1.2)
+	if ui.gui.Parent then
+		ui.copy.Text = "Copy Job ID"
+	end
+end)
+
+--------------------------------------------------------------------------
+-- Start
+--------------------------------------------------------------------------
+
+if not httpAvailable then
+	setStatus("This executor does not expose HTTP requests, so nothing can be shared or received.", THEME.red)
+	print("[Server Share] this executor does not expose HTTP requests")
+	return
+end
+
+updateInfo()
+setStatus("Starting...", THEME.amber)
+
+spawnThread(function()
+	publish()
+	while state.running do
+		waitSeconds(CONFIG.CHECK_SECONDS)
+		if not state.running then
+			break
+		end
+		local job = currentJobId()
+		local now = os.time()
+		if job ~= "" and job ~= state.lastJob then
+			publish()
+		elseif not state.lastOk and now - state.lastAttemptAt >= CONFIG.RETRY_SECONDS then
+			publish()
+		elseif now - state.lastSentAt >= CONFIG.HEARTBEAT_SECONDS then
+			publish()
+		end
+	end
+end)
+
+spawnThread(function()
+	local lastPoll = 0
+	while state.running do
+		local now = os.time()
+
+		if now - lastPoll >= CONFIG.PRESENCE_POLL_SECONDS then
+			lastPoll = now
+			collectJoiners()
+		end
+
+		-- Promote the oldest announcement to "the joiner we are waiting for".
+		if not state.active and not state.tradeStarted and #state.queue > 0 then
+			local entry = table.remove(state.queue, 1)
+			state.active = {
+				username = entry.username,
+				display = entry.display,
+				stamp = entry.stamp,
+				player = nil,
+				detectedAt = nil,
+				started = false,
+			}
+			updateInfo()
+			setStatus(
+				"Joiner " .. entry.username .. " announced this server. Waiting for them to appear...",
+				THEME.amber
+			)
+		end
+
+		if state.active then
+			if state.active.player == nil then
+				local player = findPlayerByUsername(state.active.username)
+				if player then
+					state.active.player = player
+					state.active.detectedAt = nowSeconds()
+					updateInfo()
+					print("[Server Share] " .. player.Name .. " is in this server - first trade request in " .. tostring(CONFIG.TRADE_START_DELAY_SECONDS) .. "s")
+					startCountdown(state.active)
+				end
+			elseif state.active.player.Parent == nil and not state.active.started then
+				setStatus(state.active.username .. " left before the trade could start.", THEME.red)
+				-- Forget them, so their (still cached) announcement can be picked up
+				-- again if they come back.
+				state.seen[state.active.username:lower()] = nil
+				state.active = nil
+				updateInfo()
+			end
+		end
+
+		waitSeconds(1)
+	end
+end)
+
+if type(getgenv) == "function" then
+	getgenv().ServerShareHostGui = ui.gui
+end
+
+print("[Server Share] sharing room '" .. room .. "' as " .. hostUsername .. " (" .. hostDisplay .. ")")
