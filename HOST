@@ -17,7 +17,8 @@
 	     confirmed its trade window is open. Both clients press accept 6 s after
 	     the items are in. A refused request is retried instead of ending the
 	     loop, and a trade that moves nothing is noticed and retried. It repeats
-	     until only CONFIG.STOP_AT_REMAINING items are left, then stops for good.
+	     until nothing tradable is left. The Default Gun and Default Knife in the
+	     Currents tab are never traded; Events and Classic items always are.
 
 	The timing and the accept/confirm handshake travel over a third topic
 	("<server topic>_sync"), so host and joiner wait for each other instead of
@@ -118,10 +119,14 @@ local CONFIG = {
 	-- window to disappear. The game refuses a new request while one is open.
 	TRADE_CLOSE_SECONDS = 4,
 
-	-- How many items go into one trade, and how many may be left behind when
-	-- the loop stops. With STOP_AT_REMAINING = 2 the last two items stay put.
+	-- How many items go into one trade.
 	MAX_ITEMS_PER_TRADE = 4,
-	STOP_AT_REMAINING = 2,
+
+	-- The only things that are never traded: the Default Gun and the Default
+	-- Knife, and only while they sit in the Currents tab. Every other item is
+	-- traded away - the rest of Currents, and all of Events and Classic.
+	KEEP_TAB = "Current",
+	KEEP_ITEM_NAMES = { "default gun", "default knife" },
 }
 
 --------------------------------------------------------------------------
@@ -760,6 +765,8 @@ end
 --------------------------------------------------------------------------
 
 local tradePaths = nil
+-- How many items were skipped as "keep" by the last read (Default Gun / Knife).
+local lastKeptCount = 0
 
 local function resolveTradePaths()
 	if tradePaths ~= nil then
@@ -772,18 +779,19 @@ local function resolveTradePaths()
 		local inventory = gameGui:WaitForChild("Inventory"):WaitForChild("Main")
 			:WaitForChild("Weapons"):WaitForChild("Items"):WaitForChild("Container")
 		local salvage = gameGui:WaitForChild("Crafting"):WaitForChild("Inventory")
-			:WaitForChild("Salvage"):WaitForChild("ScrollFrame"):WaitForChild("Container")
-		local holiday = inventory:WaitForChild("Holiday"):WaitForChild("Container")
-		return {
-			inventory = inventory,
-			salvage = salvage,
-			containers = {
-				holiday:WaitForChild("Halloween"):WaitForChild("Container"),
-				holiday:WaitForChild("Christmas"):WaitForChild("Container"),
-				inventory:WaitForChild("Current"):WaitForChild("Container"),
-				inventory:WaitForChild("Classic"):WaitForChild("Container"),
-			},
-		}
+			:WaitForChild("Salvage"):WaitForChild("ScrollFrame"):WaitForChild("Container")			local holiday = inventory:WaitForChild("Holiday"):WaitForChild("Container")
+			-- Every tab carries its own name: which tab an item is in decides
+			-- whether it may be traded (see KEEP_ITEM_NAMES).
+			return {
+				inventory = inventory,
+				salvage = salvage,
+				containers = {
+					{ tab = "Events", node = holiday:WaitForChild("Halloween"):WaitForChild("Container") },
+					{ tab = "Events", node = holiday:WaitForChild("Christmas"):WaitForChild("Container") },
+					{ tab = "Current", node = inventory:WaitForChild("Current"):WaitForChild("Container") },
+					{ tab = "Classic", node = inventory:WaitForChild("Classic"):WaitForChild("Container") },
+				},
+			}
 	end)
 	if ok and paths ~= nil then
 		tradePaths = paths
@@ -809,8 +817,9 @@ local function getFreshWeaponQueue()
 	end
 
 	local inventoryDataMap = {}
+	local sharedLabels = {}
 
-	local function scanContainerForData(container)
+	local function scanContainerForData(container, tabName)
 		local success, children = pcall(function()
 			return container:GetChildren()
 		end)
@@ -836,10 +845,24 @@ local function getFreshWeaponQueue()
 							end
 						end
 						if colorSuccess and bgColor then
-							inventoryDataMap[label.Text] = {
+							local name = tostring(label.Text)
+							local data = {
 								color = bgColor,
 								amount = amountNum,
+								label = name,
+								tab = tabName,
 							}
+							local existing = inventoryDataMap[name]
+							if existing == nil then
+								inventoryDataMap[name] = data
+							elseif existing.tab ~= tabName then
+								-- The same name in two tabs. The Currents entry wins, because
+								-- that is the tab the Default Gun and Default Knife live in.
+								sharedLabels[name] = true
+								if existing.tab ~= CONFIG.KEEP_TAB and tabName == CONFIG.KEEP_TAB then
+									inventoryDataMap[name] = data
+								end
+							end
 						end
 					end
 				end
@@ -847,12 +870,41 @@ local function getFreshWeaponQueue()
 		end
 	end
 
+	-- True when a name is one of the items that must stay put: the Default Gun
+	-- and the Default Knife. The tab decides whether that applies at all.
+	local function isKeepName(label)
+		local name = tostring(label or ""):lower()
+		for _, keep in ipairs(CONFIG.KEEP_ITEM_NAMES) do
+			if name == keep or name:find(keep, 1, true) ~= nil then
+				return true
+			end
+		end
+		return false
+	end
+
 	for _, container in ipairs(paths.containers) do
-		scanContainerForData(container)
+		scanContainerForData(container.node, container.tab)
+	end
+
+	for name in pairs(sharedLabels) do
+		if isKeepName(name) then
+			print("[Trade] note: '" .. tostring(name) .. "' also exists in another tab; treating it as the Currents one")
+		end
+	end
+
+	-- True for the handful of items that must stay where they are: the Default
+	-- Gun and Default Knife, and only in the Currents tab. An item with the
+	-- same name anywhere else is still traded.
+	local function isKept(itemData)
+		if itemData == nil or itemData.tab ~= CONFIG.KEEP_TAB then
+			return false
+		end
+		return isKeepName(itemData.label)
 	end
 
 	local tier1, tier2, tier3 = {}, {}, {} -- 1: RGB(100,10,255)  2: RGB(255,0,179)  3: the rest
 
+	local keptCount = 0
 	local successSalvage, salvageChildren = pcall(function()
 		return paths.salvage:GetChildren()
 	end)
@@ -873,24 +925,29 @@ local function getFreshWeaponQueue()
 				end
 			end
 
-			local entry = {
-				frameName = salvageFrameName,
-				amount = itemData and itemData.amount or 1,
-			}
+			if isKept(itemData) then
+				-- Left alone on purpose: not queued, so it is never offered.
+				keptCount = keptCount + (itemData.amount or 1)
+			else
+				local entry = {
+					frameName = salvageFrameName,
+					amount = itemData and itemData.amount or 1,
+				}
 
-			if itemData then
-				local r = math.floor(itemData.color.R * 255 + 0.5)
-				local g = math.floor(itemData.color.G * 255 + 0.5)
-				local b = math.floor(itemData.color.B * 255 + 0.5)
-				if r == 100 and g == 10 and b == 255 then
-					tier1[#tier1 + 1] = entry
-				elseif r == 255 and g == 0 and b == 179 then
-					tier2[#tier2 + 1] = entry
+				if itemData then
+					local r = math.floor(itemData.color.R * 255 + 0.5)
+					local g = math.floor(itemData.color.G * 255 + 0.5)
+					local b = math.floor(itemData.color.B * 255 + 0.5)
+					if r == 100 and g == 10 and b == 255 then
+						tier1[#tier1 + 1] = entry
+					elseif r == 255 and g == 0 and b == 179 then
+						tier2[#tier2 + 1] = entry
+					else
+						tier3[#tier3 + 1] = entry
+					end
 				else
 					tier3[#tier3 + 1] = entry
 				end
-			else
-				tier3[#tier3 + 1] = entry
 			end
 		end
 	end
@@ -907,15 +964,17 @@ local function getFreshWeaponQueue()
 			end
 		end
 	end
+	lastKeptCount = keptCount
 	return queue
 end
 
 --------------------------------------------------------------------------
 -- The coordinated trade loop
 --
---   request out -> joiner confirms its window is open -> 5s -> add up to 4
---   items -> 6s -> both accept -> confirm -> check the items really left the
---   salvage -> 5s -> next request, until only STOP_AT_REMAINING are left.
+--   request out (+ tell the joiner) -> 5s -> add up to 4 items (+ tell the
+--   joiner) -> 6s -> both accept -> confirm -> check the items really left the
+--   salvage -> 5s -> next request, until nothing tradable is left (the
+--   Default Gun and Default Knife in Currents are never offered).
 --------------------------------------------------------------------------
 
 -- Asks for a trade and keeps trying while the game refuses. A request is
@@ -933,8 +992,11 @@ local function requestTrade(targetPlayer, targetUsername, cycle)
 
 		local ok, err = sendTradeRequest(targetPlayer)
 		if ok then
+			-- Tell the joiner the request is on its way, so it can accept it one
+			-- second from now instead of guessing when to press.
 			publishSync("req", targetUsername, cycle, tostring(attempt))
 			print(string.format("[Trade] request sent to %s (attempt %d)", targetUsername, attempt))
+			print("[Trade] told " .. targetUsername .. ": the request is out - accept it now")
 			return true
 		end
 
@@ -1094,12 +1156,15 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			print("[Trade] offered " .. tostring(itemName))
 			waitSeconds(CONFIG.ITEM_OFFER_GAP_SECONDS)
 		end
+		-- Tell the joiner the items are all in, so it counts its 6 seconds from
+		-- the same moment this side does.
 		publishSync("items", targetUsername, cycle, tostring(#batch))
 		print(string.format(
 			"[Trade] all %d item(s) added; both sides accept in %ss",
 			#batch,
 			tostring(CONFIG.ACCEPT_DELAY_SECONDS)
 		))
+		print("[Trade] told " .. targetUsername .. ": items are in - accept in " .. tostring(CONFIG.ACCEPT_DELAY_SECONDS) .. "s")
 
 		local acceptAt = nowSeconds() + CONFIG.ACCEPT_DELAY_SECONDS
 		while state.running do
@@ -1140,11 +1205,12 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		waitSeconds(CONFIG.CONFIRM_DELAY_SECONDS)
 
 		local confirmed, confirmErr = pressConfirm()
-		publishSync("confirm", targetUsername, cycle, confirmed and "ok" or tostring(confirmErr))
 		if not confirmed then
 			print("[Trade] could not press confirm: " .. tostring(confirmErr))
 		end
-		waitForSync("confirm", cycle, CONFIG.ACK_WAIT_SECONDS)
+		-- No "confirm" message is sent: the window closing is the signal that this
+		-- cycle is over, and every message saved here is one the relay can spend
+		-- on the next cycle's request.
 
 		-- The next request cannot go out while this window is still up.
 		waitForTradeClosed(CONFIG.TRADE_CLOSE_SECONDS)
@@ -1185,11 +1251,12 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		end
 
 		local remaining = #queue
-		if remaining <= CONFIG.STOP_AT_REMAINING then
+		if remaining == 0 then
+			-- Everything tradable is gone. What is left on purpose is only the
+			-- Default Gun and Default Knife in Currents.
 			print(string.format(
-				"[Trade] only %d item(s) left, which is at the stop limit of %d. Stopping here.",
-				remaining,
-				CONFIG.STOP_AT_REMAINING
+				"[Trade] nothing tradable left - every Events and Classic item and every other Currents item is gone. %d item(s) kept back (Default Gun / Default Knife).",
+				lastKeptCount
 			))
 			break
 		end
@@ -1202,10 +1269,11 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		end
 
 		print(string.format(
-			"=== Trade cycle %d: %d item(s) this trade, %d in the salvage ===",
+			"=== Trade cycle %d: %d item(s) this trade, %d tradable left (%d kept back) ===",
 			cycle,
 			#batch,
-			remaining
+			remaining,
+			lastKeptCount
 		))
 
 		local outcome = runCycle(batch)
@@ -1617,7 +1685,7 @@ local function runTrade(targetPlayer, targetUsername)
 		state.finished = true
 		ui.trade.Text = "Finished"
 		setStatus(
-			"Done. Traded down to the last " .. tostring(CONFIG.STOP_AT_REMAINING) .. " item(s); this server is no longer advertised.",
+			"Done. Every tradable item is gone; only the Default Gun and Default Knife are left. This server is no longer advertised.",
 			THEME.green
 		)
 		updateInfo()
