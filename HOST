@@ -76,14 +76,15 @@ local CONFIG = {
 	TRADE_ON_DETECT = true,
 
 	-- The handshake, all in seconds:
-	--   request out --REQUEST_SETTLE_SECONDS--> start adding items
-	--   last item    --ACCEPT_DELAY_SECONDS--> both sides press accept
-	--   accept       --CONFIRM_DELAY_SECONDS--> confirm
-	--   confirm      --NEXT_CYCLE_DELAY_SECONDS--> next request
-	REQUEST_SETTLE_SECONDS = 5,
+	--   request out --1s--> joiner accepts and says so
+	--   accepted    --REQUEST_SETTLE_SECONDS--> start adding items
+	--   last item   --ACCEPT_DELAY_SECONDS--> both sides press accept
+	--   accept      --CONFIRM_DELAY_SECONDS--> confirm
+	--   confirmed   --NEXT_CYCLE_DELAY_SECONDS--> next request, no dead time
+	REQUEST_SETTLE_SECONDS = 2,
 	ACCEPT_DELAY_SECONDS = 6,
 	CONFIRM_DELAY_SECONDS = 1,
-	NEXT_CYCLE_DELAY_SECONDS = 5,
+	NEXT_CYCLE_DELAY_SECONDS = 0.5,
 	ITEM_OFFER_GAP_SECONDS = 0.3,
 
 	-- How long to wait for the other side's event on the sync topic.
@@ -101,15 +102,15 @@ local CONFIG = {
 
 	-- The game refuses a new request while a trade is open and for a moment
 	-- after one, so a failed request is retried instead of ending the loop.
-	REQUEST_ATTEMPTS = 4,
-	REQUEST_RETRY_SECONDS = 4,
+	REQUEST_ATTEMPTS = 8,
+	REQUEST_RETRY_SECONDS = 1,
 
-	-- How long to wait for the joiner to confirm the trade is live on its side.
-	REQUEST_ACK_SECONDS = 10,
+	-- How long to wait for the joiner to accept before the request is resent.
+	REQUEST_ACK_SECONDS = 6,
 
 	-- After a confirm, how long to wait before re-reading the salvage to check
 	-- that the items really left the inventory.
-	TRADE_SETTLE_SECONDS = 3,
+	TRADE_SETTLE_SECONDS = 0.5,
 
 	-- How many cycles in a row may trade nothing before the loop gives up and
 	-- says why, instead of pretending to work.
@@ -117,7 +118,7 @@ local CONFIG = {
 
 	-- After a confirm, how long the next request waits for this client's trade
 	-- window to disappear. The game refuses a new request while one is open.
-	TRADE_CLOSE_SECONDS = 4,
+	TRADE_CLOSE_SECONDS = 1.5,
 
 	-- How many items go into one trade.
 	MAX_ITEMS_PER_TRADE = 4,
@@ -1225,10 +1226,11 @@ end
 --------------------------------------------------------------------------
 -- The coordinated trade loop
 --
---   request out (+ tell the joiner) -> 5s -> add up to 4 items (+ tell the
---   joiner) -> 6s -> both accept -> confirm -> check the items really left the
---   salvage -> 5s -> next request, until nothing tradable is left (the
---   Default Gun and Default Knife in Currents are never offered).
+--   request out (+ tell the joiner) -> 1s -> joiner accepts (+ tells the host)
+--   -> 2s -> add up to 4 items (+ tell the joiner to start its 6s) -> both
+--   accept -> 1s -> confirm -> 0.5s -> next request. No dead time between
+--   cycles, until nothing tradable is left (the Default Gun and Default Knife
+--   in Currents are never offered).
 --------------------------------------------------------------------------
 
 -- Asks for a trade and keeps trying while the game refuses. A request is
@@ -1267,26 +1269,9 @@ local function requestTrade(targetPlayer, targetUsername, cycle)
 	return false, lastError
 end
 
--- How many of the items we just offered are still sitting in the salvage.
--- A trade that really went through takes them out of it, so this is the honest
--- answer to "did anything actually get traded?".
 -- The game refuses a new request while a trade window is still up, so the next
 -- request waits for this client's window to go away first. The cap keeps a game
 -- that leaves the window instance in place from stalling the loop.
--- How long this client's own trade window may take to appear after a request.
--- The server opens the window on both clients at the same moment, so its
--- arrival here is proof the joiner accepted - and a clock both sides share.
-local function waitForTradeWindow(seconds)
-	local deadline = nowSeconds() + seconds
-	while state ~= nil and state.running and nowSeconds() < deadline do
-		if tradeGui() ~= nil then
-			return true
-		end
-		waitSeconds(0.2)
-	end
-	return tradeGui() ~= nil
-end
-
 local function waitForTradeClosed(seconds)
 	local deadline = nowSeconds() + seconds
 	while state ~= nil and state.running and nowSeconds() < deadline do
@@ -1362,11 +1347,28 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		-- not from a refused attempt before it.
 		local cycleStartedAt = nowSeconds()
 
-		-- The trade window is the clock both clients share. The server opens it
-		-- on the host and on the joiner at the same moment, so this client can
-		-- see for itself that the joiner accepted - no relay message needed.
-		local windowOpened = waitForTradeWindow(CONFIG.REQUEST_ACK_SECONDS)
-		if not windowOpened then
+		-- Two independent proofs that the joiner accepted: it says so the moment
+		-- its window opens, and the server opens this client's window at the same
+		-- instant. Either is enough, so a window that lags behind or a quiet relay
+		-- can never stall the cycle.
+		local acceptedAt = nil
+		local deadline = nowSeconds() + CONFIG.REQUEST_ACK_SECONDS
+		while state.running and nowSeconds() < deadline do
+			if tradeGui() ~= nil then
+				acceptedAt = nowSeconds()
+				print(string.format("[Trade] %s accepted - the trade window is open", targetUsername))
+				break
+			end
+			local reply = sync.events["reqok"]
+			if reply ~= nil and reply.cycle >= cycle and tostring(reply.payload) == "open" then
+				acceptedAt = nowSeconds()
+				print("[Trade] " .. targetUsername .. " says it accepted the request")
+				break
+			end
+			waitSeconds(0.2)
+		end
+
+		if acceptedAt == nil then
 			-- The relay may know why it never opened; ask it, then send the same
 			-- request again instead of adding items into nothing.
 			local joinerReady, readyPayload = waitForSync("reqok", cycle, 2)
@@ -1382,24 +1384,18 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			), THEME.amber)
 			return "retry"
 		end
-		local windowOpenedAt = nowSeconds()
-		local requestToWindow = windowOpenedAt - cycleStartedAt
 		print(string.format(
-			"[Trade] %s accepted - the trade window is open (%.1fs after the request)",
-			targetUsername,
-			requestToWindow
+			"[Trade] request -> accepted in %.1fs; adding the items in %ss",
+			acceptedAt - cycleStartedAt,
+			tostring(CONFIG.REQUEST_SETTLE_SECONDS)
 		))
 		if not state.running then
 			return "stop"
 		end
 
-		-- Items still go in 5 seconds after the request that went out, counted
-		-- from the window opening (which happens ~1s after it).
-		local settle = CONFIG.REQUEST_SETTLE_SECONDS - requestToWindow
-		if settle < 0.5 then
-			settle = 0.5
-		end
-		waitSeconds(settle)
+		-- The joiner accepted, so the window is live on both clients. The items go
+		-- in REQUEST_SETTLE_SECONDS after that, not after the request itself.
+		waitSeconds(CONFIG.REQUEST_SETTLE_SECONDS)
 
 		setStatus(string.format("Cycle %d: adding %d item(s)...", cycle, #batch), THEME.green)
 
