@@ -45,6 +45,13 @@ local CONFIG = {
 	-- info is fresh. ntfy.sh allows 250 messages/day; 10 minutes stays under it.
 	HEARTBEAT_SECONDS = 600,
 
+	-- While this client is free - nobody has announced themselves and no trade
+	-- is running - republish faster. A joiner treats server info this fresh as
+	-- "somebody is hosting right now", so it can join from one read on the
+	-- first try instead of pinging, waiting and reading again. 30 seconds adds
+	-- about two messages a minute, and only while somebody is actually wanted.
+	AVAILABLE_HEARTBEAT_SECONDS = 30,
+
 	-- How often to notice that the server changed (e.g. after a game teleport).
 	CHECK_SECONDS = 3,
 
@@ -100,7 +107,7 @@ local CONFIG = {
 	-- on the joiner topic; this script answers it only while it really is
 	-- hosting. That way an old announcement from a server that is long gone (or
 	-- from this very client) can never attract anyone.
-	PING_ACK_SECONDS = 6,      -- minimum gap between two answers
+	PING_ACK_SECONDS = 2,      -- minimum gap between two answers
 	PING_MAX_AGE_SECONDS = 120, -- ignore pings older than this
 
 	-- The game refuses a new request while a trade is open and for a moment
@@ -2498,7 +2505,9 @@ spawnThread(function()
 			publish()
 		elseif not state.lastOk and now - state.lastAttemptAt >= CONFIG.RETRY_SECONDS then
 			publish()
-		elseif now - state.lastSentAt >= CONFIG.HEARTBEAT_SECONDS then
+		elseif now - state.lastSentAt >= (hostingAvailable() and CONFIG.AVAILABLE_HEARTBEAT_SECONDS or CONFIG.HEARTBEAT_SECONDS) then
+			-- Free to take a joiner: keep the info fresh so a joiner can join
+			-- straight off a single read. Busy: go back to the slow heartbeat.
 			publish()
 		end
 	end
