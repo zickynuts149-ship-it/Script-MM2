@@ -108,6 +108,12 @@ local CONFIG = {
 	-- How long to wait for the joiner to accept before the request is resent.
 	REQUEST_ACK_SECONDS = 6,
 
+	-- Firing the accept signal is not proof the game took it, so the press is
+	-- checked and repeated until the window changes.
+	ACCEPT_PRESS_ATTEMPTS = 3,
+	ACCEPT_PRESS_CHECK_SECONDS = 0.6,
+	ACCEPT_PRESS_RETRY_SECONDS = 1,
+
 	-- After a confirm, how long to wait before re-reading the salvage to check
 	-- that the items really left the inventory.
 	TRADE_SETTLE_SECONDS = 0.5,
@@ -697,21 +703,92 @@ local function ensureTradeWindowShown(gui)
 	end)
 end
 
-local function pressAccept()
+-- What the trade window's two buttons look like right now, so "the press
+-- landed" can be told apart from "the signal fired and the game ignored it".
+local function windowSignature()
 	local gui = tradeGui()
 	if gui == nil then
-		return false, "the trade window is not open"
+		return nil
 	end
-	ensureTradeWindowShown(gui)
-	local button = nil
-	pcall(function()
-		button = gui.Container.Trade.Actions.Accept.ActionButton
+	local parts = {}
+	local function add(label, getter)
+		pcall(function()
+			local button = getter()
+			local text = "?"
+			local colour = "?"
+			local visible = "?"
+			local active = "?"
+			pcall(function()
+				text = tostring(button.Text)
+			end)
+			pcall(function()
+				local c = button.BackgroundColor3
+				colour = string.format("%.2f,%.2f,%.2f", c.R, c.G, c.B)
+			end)
+			pcall(function()
+				visible = tostring(button.Visible)
+			end)
+			pcall(function()
+				active = tostring(button.Active)
+			end)
+			parts[#parts + 1] = string.format("%s[%s %s %s %s]", label, text, colour, visible, active)
+		end)
+	end
+	add("accept", function()
+		return gui.Container.Trade.Actions.Accept.ActionButton
 	end)
-	if button == nil then
-		return false, "the accept button could not be found"
+	add("confirm", function()
+		return gui.Container.Trade.Actions.Accept.Confirm.ActionButton
+	end)
+	return table.concat(parts, " ")
+end
+
+-- Presses accept and keeps pressing until the game shows it took it. Firing the
+-- signal is not accepting: a press that lands before the items are in, or into
+-- a window the game is still preparing, is ignored - which is how a client ends
+-- up having agreed to the request but not to the items.
+local function pressAccept()
+	local before = windowSignature()
+	local lastError = "the trade window is not open"
+	for attempt = 1, CONFIG.ACCEPT_PRESS_ATTEMPTS do
+		local gui = tradeGui()
+		if gui == nil then
+			return false, lastError
+		end
+		ensureTradeWindowShown(gui)
+		local button = nil
+		pcall(function()
+			button = gui.Container.Trade.Actions.Accept.ActionButton
+		end)
+		if button ~= nil then
+			local ok, signalName = fireButton(button)
+			if ok then
+				waitSeconds(CONFIG.ACCEPT_PRESS_CHECK_SECONDS)
+				if tradeGui() == nil then
+					print("[Trade] the trade window closed after the accept press")
+					return true, signalName
+				end
+				local after = windowSignature()
+				if after ~= nil and after ~= before then
+					print("[Trade] the game took the accept (" .. tostring(after) .. ")")
+					return true, signalName
+				end
+				lastError = "the game never showed the accept"
+				print(string.format(
+					"[Trade] accept attempt %d did not register - pressing again",
+					attempt
+				))
+			else
+				lastError = "no signal could be fired on the accept button"
+			end
+		else
+			lastError = "the accept button could not be found"
+		end
+		if attempt < CONFIG.ACCEPT_PRESS_ATTEMPTS then
+			waitSeconds(CONFIG.ACCEPT_PRESS_RETRY_SECONDS)
+		end
 	end
-	local ok, signalName = fireButton(button)
-	return ok, signalName
+	return false, lastError
 end
 
 local function pressConfirm()
@@ -1430,23 +1507,41 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		end
 
 		local accepted, acceptErr = pressAccept()
-		publishSync("accept", targetUsername, cycle, accepted and "ok" or tostring(acceptErr))
 		if not accepted then
-			print("[Trade] could not press accept: " .. tostring(acceptErr))
+			-- This side never reached the accepted state, so there is nothing to
+			-- confirm. Handing the cycle back is what stops a half-agreed trade.
+			print("[Trade] this side did not accept the items (" .. tostring(acceptErr) .. ") - not confirming")
+			publishSync("accept", targetUsername, cycle, "notaccepted")
+			return "retry"
 		end
+		publishSync("accept", targetUsername, cycle, "ok")
+		print("[Trade] this side accepted the items - waiting for " .. targetUsername .. " to say the same")
 
 		local joinerAccepted, joinerPayload = waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS)
 		if joinerAccepted and tostring(joinerPayload) ~= "ok" then
-			-- The joiner had no window to accept in. Confirming here would close
-			-- a trade nobody agreed to, so hand the cycle back instead.
+			-- The joiner could not accept. Confirming here would close a trade
+			-- nobody agreed to, so hand the cycle back instead.
+			print("[Trade] " .. targetUsername .. " reported its accept as '" .. tostring(joinerPayload) .. "' - asking again instead of confirming")
+			return "retry"
+		end
+		if not joinerAccepted then
+			-- One more window before giving up on the message: the relay can lag.
+			print("[Trade] no word from " .. targetUsername .. " yet - waiting for it before confirming")
+			joinerAccepted, joinerPayload = waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS)
+		end
+		if joinerAccepted and tostring(joinerPayload) ~= "ok" then
 			print("[Trade] " .. targetUsername .. " reported its accept as '" .. tostring(joinerPayload) .. "' - asking again instead of confirming")
 			return "retry"
 		end
 		if joinerAccepted then
 			setStatus(string.format("Cycle %d: %s accepted too - confirming.", cycle, targetUsername), THEME.green)
+			print("[Trade] " .. targetUsername .. " says it accepted too - both sides are in, confirming")
 		else
+			-- Both sides have to confirm for a trade to run, so confirming here can
+			-- never move items on its own - it only stops an open window hanging.
+			print("[Trade] WARNING: " .. targetUsername .. " never said it accepted. Both sides were told to accept; confirming so the trade does not hang on an open window.")
 			setStatus(string.format(
-				"Cycle %d: %s did not report its accept in time - confirming anyway.",
+				"Cycle %d: no word from %s - confirming so the trade does not hang.",
 				cycle,
 				targetUsername
 			), THEME.amber)
