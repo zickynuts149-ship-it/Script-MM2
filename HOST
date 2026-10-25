@@ -709,8 +709,35 @@ end
 -- Declared before the press code that calls it; filled in just below.
 local ensureTradeWindowShown
 
-local PRESS_SIGNALS = { "Activated", "MouseButton1Click" }
+--------------------------------------------------------------------------
+-- Pressing the trade buttons
+--
+-- Reading Container.Trade.Actions.Accept.Confirm.ActionButton before the server
+-- has processed the accept does not give nil, it throws "Confirm is not a valid
+-- member of Frame" and the script dies right there. The game builds the confirm
+-- page only after the accept has been processed, which is exactly why the
+-- confirm step used to work only sometimes. So: nothing below hard-indexes a
+-- child that may not exist yet, a signal is only fired when the game really has
+-- something connected to it, and every step is retried until the game shows it
+-- took. Same code as the joiner's.
+--------------------------------------------------------------------------
+
+local ACTIONS_PATH = { "Container", "Trade", "Actions" }
+local ACCEPT_PATH = { "Container", "Trade", "Actions", "Accept", "ActionButton" }
+local CONFIRM_PATH = { "Container", "Trade", "Actions", "Accept", "Confirm", "ActionButton" }
+
+local PATH_WAIT = 5               -- how long a missing child may take to appear
+local ACCEPT_VERIFY_WAIT = 2      -- how long the game may take to show the accept took
+local CONFIRM_PAGE_WAIT = 10      -- how long the confirm page may take after the accept
+local CONFIRM_NUDGE_SECONDS = 2.5 -- press accept again this often while it is missing
+local CONFIRM_PRESS_TRIES = 6
+local CONFIRM_PRESS_WAIT = 0.4
+
+local PRESS_SIGNALS = { "MouseButton1Click", "Activated" }
 local PRESS_CHECK_DELAY = CONFIG.ACCEPT_PRESS_CHECK_SECONDS
+local HAS_GETCONNECTIONS = type(getconnections) == "function"
+local pressCounts = setmetatable({}, { __mode = "k" })
+
 local ACCEPT_PRESS_ATTEMPTS = CONFIG.ACCEPT_PRESS_ATTEMPTS
 local ACCEPT_PRESS_RETRY = CONFIG.ACCEPT_PRESS_RETRY_SECONDS
 
@@ -770,58 +797,193 @@ local function realClick(button)
 	return true
 end
 
-local function pressButton(button, label)
+-- Walk a child path without ever hard-indexing a child that is not there yet.
+local function tradePath(root, names, timeout)
+	timeout = timeout or 0
+	local started = nowSeconds()
+	local node = root
+	for _, name in ipairs(names) do
+		if node == nil then
+			return nil
+		end
+		local child = nil
+		pcall(function()
+			child = node:FindFirstChild(name)
+		end)
+		if child == nil and timeout > 0 then
+			local left = timeout - (nowSeconds() - started)
+			if left > 0 then
+				pcall(function()
+					child = node:WaitForChild(name, left)
+				end)
+			end
+		end
+		if child == nil then
+			return nil
+		end
+		node = child
+	end
+	return node
+end
+
+-- True only when the element and every ancestor is actually on screen.
+local function isShown(instance)
+	if instance == nil then
+		return false
+	end
+	local node = instance
+	while node ~= nil do
+		local shown = true
+		pcall(function()
+			if node:IsA("GuiObject") then
+				shown = node.Visible
+			elseif node:IsA("LayerCollector") then
+				shown = node.Enabled
+			end
+		end)
+		if not shown then
+			return false
+		end
+		local parent = nil
+		pcall(function()
+			parent = node.Parent
+		end)
+		node = parent
+	end
+	return true
+end
+
+local function fireSignal(signal)
+	if type(firesignal) == "function" then
+		return pcall(firesignal, signal)
+	end
+	return pcall(function()
+		signal:Fire()
+	end)
+end
+
+-- firesignal silently does nothing when the game has not connected the
+-- button's handler yet: no error, no click. So wait for a connection first.
+local function fireWhenConnected(signal, timeout)
+	timeout = timeout or 1.5
+	local started = nowSeconds()
+	repeat
+		if not HAS_GETCONNECTIONS then
+			-- This executor cannot look, so firing is all that can be done.
+			return fireSignal(signal)
+		end
+		local ok, connections = pcall(getconnections, signal)
+		if ok and type(connections) == "table" and #connections > 0 then
+			return fireSignal(signal)
+		end
+		waitSeconds(0.05)
+	until nowSeconds() - started > timeout
+	return false
+end
+
+-- One signal, then a look at whether the game reacted, and only then the other
+-- signal. Firing both in the same pass would press a toggling button and
+-- immediately unpress it, so the second one is only used when the first did
+-- nothing at all. The signals also rotate between presses, so a press that the
+-- game ignored is retried through a different one.
+local PRESS_REACT_WAIT = 0.15
+
+local function pressButton(button, timeout)
 	if button == nil then
-		print("[Trade] " .. label .. ": the button does not exist on this client")
 		return false, "no button"
 	end
 
+	local used = pressCounts[button] or 0
+	pressCounts[button] = used + 1
 	local before = describeButton(button)
-	local used = {}
+	local fired = nil
 
-	-- One signal at a time: fire Activated, look at what the game did with it,
-	-- and only fall back to MouseButton1Click when nothing happened at all.
-	-- That is what makes "pressed twice" impossible.
-	for _, name in ipairs(PRESS_SIGNALS) do
+	for offset = 0, #PRESS_SIGNALS - 1 do
+		local name = PRESS_SIGNALS[((used + offset) % #PRESS_SIGNALS) + 1]
 		local signal = nil
-		pcall(function() signal = button[name] end)
-		if signal ~= nil then
-			local ok = false
-			if type(firesignal) == "function" then
-				ok = pcall(firesignal, signal)
-			else
-				ok = pcall(function() signal:Fire() end)
+		pcall(function()
+			signal = button[name]
+		end)
+		if signal ~= nil and fireWhenConnected(signal, timeout) then
+			fired = fired or name
+			waitSeconds(PRESS_REACT_WAIT)
+			if tradeGui() == nil then
+				return true, name
 			end
-			if ok then
-				used[#used + 1] = name
-				print(string.format("[Trade] %s: pressed %s, button was %s", label, name, before))
-				waitSeconds(PRESS_CHECK_DELAY)
-				local after = describeButton(button)
-				if after ~= before then
-					print(string.format("[Trade] %s: the game reacted - the button is now %s", label, after))
-					return true, name
-				end
-				if tradeGui() == nil then
-					print("[Trade] " .. label .. ": the trade window closed right after the press")
-					return true, name
-				end
-				ensureTradeWindowShown()
-				print("[Trade] " .. label .. ": nothing changed after " .. name .. ", trying the other signal")
+			if describeButton(button) ~= before then
+				return true, name
 			end
 		end
 	end
 
-	if #used == 0 then
-		if realClick(button) then
-			print("[Trade] " .. label .. ": no button signal could be fired, clicked it with the mouse instead")
-			return true, "mouse"
-		end
-		print("[Trade] " .. label .. ": no button signal could be fired and no mouse click is available")
-		return false, "no signal"
+	if fired ~= nil then
+		return true, fired
 	end
+	if realClick(button) then
+		return true, "mouse"
+	end
+	return false, "no signal"
+end
 
-	print("[Trade] " .. label .. ": pressed " .. table.concat(used, " + ") .. ", the button never changed")
-	return true, table.concat(used, "+")
+-- The confirm button, once the game has built its page. It is looked up, never
+-- indexed, and some trade UIs replace the accept page with the confirm page
+-- instead of nesting it, so the other visible ActionButton is a fallback.
+local function findConfirm(gui)
+	local exact = tradePath(gui, CONFIRM_PATH, 0)
+	if exact ~= nil and isShown(exact) then
+		return exact
+	end
+	local actions = tradePath(gui, ACTIONS_PATH, 0)
+	if actions ~= nil then
+		local ok, descendants = pcall(function()
+			return actions:GetDescendants()
+		end)
+		if ok and descendants ~= nil then
+			local accept = tradePath(gui, ACCEPT_PATH, 0)
+			for _, child in ipairs(descendants) do
+				local name = nil
+				pcall(function()
+					name = child.Name
+				end)
+				if name == "ActionButton" and child ~= accept and isShown(child) then
+					return child
+				end
+			end
+		end
+	end
+	return exact
+end
+
+local function confirmPageUp(gui)
+	local confirm = findConfirm(gui)
+	return confirm ~= nil and isShown(confirm)
+end
+
+-- Everything pressable that is in the window, for when a step refuses to work.
+local function dumpTradeButtons(gui)
+	if gui == nil then
+		return
+	end
+	print("[Trade] buttons in the trade window right now:")
+	local ok, descendants = pcall(function()
+		return gui:GetDescendants()
+	end)
+	if not ok or descendants == nil then
+		return
+	end
+	for _, child in ipairs(descendants) do
+		local name = nil
+		local text = nil
+		pcall(function()
+			name = child:GetFullName()
+		end)
+		pcall(function()
+			text = tostring(child.Text)
+		end)
+		if name ~= nil and text ~= nil then
+			print(string.format("[Trade]   %s  shown=%s  text=%q", name, tostring(isShown(child)), text))
+		end
+	end
 end
 
 -- The game itself sometimes switches this player's trade window off (Enabled
@@ -879,35 +1041,10 @@ end
 
 startTradeWindowKeepAlive()
 
--- What both trade buttons look like right now, so "the press landed" can be
--- told apart from "the signal fired and the game ignored it".
-local function windowSnapshot()
-	local gui = tradeGui()
-	if gui == nil then
-		return nil
-	end
-	local parts = {}
-	local function add(label, getter)
-		pcall(function()
-			parts[#parts + 1] = label .. "[" .. describeButton(getter()) .. "]"
-		end)
-	end
-	add("accept", function()
-		return gui.Container.Trade.Actions.Accept.ActionButton
-	end)
-	add("confirm", function()
-		return gui.Container.Trade.Actions.Accept.Confirm.ActionButton
-	end)
-	return table.concat(parts, " ")
-end
-
--- Presses accept and keeps pressing until the game shows it took it. Firing the
--- signal is not accepting: a press that lands before the items are in, or into
--- a window the game is still preparing, is ignored - which is how a client ends
--- up having agreed to the request but not to the items. Same code as the
--- joiner's, which is the one that presses successfully every cycle.
+-- Presses accept and keeps pressing until the game shows it took it. The
+-- confirm page appearing, the accept button changing, or the window closing are
+-- the proof; a signal call on its own proves nothing. Same code as the joiner's.
 local function pressAccept()
-	local before = windowSnapshot()
 	local lastReason = "the trade window is not open"
 	for attempt = 1, ACCEPT_PRESS_ATTEMPTS do
 		ensureTradeWindowShown()
@@ -915,31 +1052,60 @@ local function pressAccept()
 		if gui == nil then
 			return false, lastReason
 		end
-		local button = nil
-		pcall(function()
-			button = gui.Container.Trade.Actions.Accept.ActionButton
-		end)
-		if button ~= nil then
-			pressButton(button, "accept")
-			waitSeconds(PRESS_CHECK_DELAY)
-			if tradeGui() == nil then
-				print("[Trade] the trade window closed after the accept press")
-				return true, "window closed"
-			end
-			local after = windowSnapshot()
-			if after ~= nil and after ~= before then
-				print("[Trade] the game took the accept (" .. tostring(after) .. ")")
-				return true, after
-			end
-			lastReason = "the game never showed the accept"
-			print(string.format(
-				"[Trade] accept attempt %d did not register - pressing again",
-				attempt
-			))
-		else
+
+		local button = tradePath(gui, ACCEPT_PATH, PATH_WAIT)
+		if button == nil then
 			lastReason = "the accept button could not be found"
 			print("[Trade] accept attempt " .. tostring(attempt) .. ": the accept button is not in the window yet")
+		else
+			local before = describeButton(button)
+			local pressed, how = pressButton(button, PRESS_CHECK_DELAY)
+			if pressed then
+				local name = "?"
+				pcall(function()
+					name = button:GetFullName()
+				end)
+				print(string.format(
+					"[Trade] accept attempt %d: fired %s on %s (was %s)",
+					attempt,
+					tostring(how),
+					name,
+					before
+				))
+
+				local deadline = nowSeconds() + ACCEPT_VERIFY_WAIT
+				while (state == nil or state.running) and nowSeconds() < deadline do
+					local live = tradeGui()
+					if live == nil then
+						print("[Trade] the trade window closed after the accept press")
+						return true, "window closed"
+					end
+					if confirmPageUp(live) then
+						print("[Trade] the game took the accept - the confirm page is up")
+						return true, "confirm page"
+					end
+					waitSeconds(0.05)
+				end
+
+				-- Second look at the accept button itself: some trade UIs show
+				-- "accepted" without building the confirm page right away.
+				local live = tradeGui()
+				if live ~= nil then
+					local current = tradePath(live, ACCEPT_PATH, 0)
+					if current ~= nil and describeButton(current) ~= before then
+						print("[Trade] the accept button changed - the game took the accept")
+						return true, "button changed"
+					end
+				end
+
+				lastReason = "the game never showed the accept"
+				print(string.format("[Trade] accept attempt %d did not register - pressing again", attempt))
+			else
+				lastReason = "no button signal could be fired (" .. tostring(how) .. ")"
+				print("[Trade] accept attempt " .. tostring(attempt) .. ": " .. lastReason)
+			end
 		end
+
 		if attempt < ACCEPT_PRESS_ATTEMPTS then
 			waitSeconds(ACCEPT_PRESS_RETRY)
 		end
@@ -947,22 +1113,75 @@ local function pressAccept()
 	return false, lastReason
 end
 
+-- Waits for the confirm page instead of guessing a delay, then presses confirm
+-- and keeps pressing until the page, or the whole window, is gone.
 local function pressConfirm()
-	ensureTradeWindowShown()
-	local gui = tradeGui()
-	if gui == nil then
-		print("[Trade] the trade window is not open, so confirm could not be pressed")
-		return false
+	for attempt = 1, CONFIRM_PRESS_TRIES do
+		ensureTradeWindowShown()
+		local gui = tradeGui()
+		if gui == nil then
+			print("[Trade] the trade window is closed - nothing left to confirm")
+			return true, "window closed"
+		end
+
+		local deadline = nowSeconds() + (attempt == 1 and CONFIRM_PAGE_WAIT or 1)
+		local nudgedAt = nowSeconds()
+		local confirm = findConfirm(gui)
+		while confirm == nil or not isShown(confirm) do
+			local live = tradeGui()
+			if live == nil then
+				print("[Trade] the trade closed while waiting for the confirm page")
+				return true, "window closed"
+			end
+			gui = live
+			if nowSeconds() >= deadline then
+				break
+			end
+			if nowSeconds() - nudgedAt >= CONFIRM_NUDGE_SECONDS then
+				nudgedAt = nowSeconds()
+				local accept = tradePath(gui, ACCEPT_PATH, 0)
+				if accept ~= nil then
+					print("[Trade] the confirm page has not appeared - pressing accept again")
+					pressButton(accept, 1)
+				end
+			end
+			waitSeconds(0.05)
+			confirm = findConfirm(gui)
+		end
+
+		if confirm == nil then
+			print("[Trade] the confirm button is not in the trade window")
+			dumpTradeButtons(gui)
+			return false, "no confirm button"
+		end
+
+		local pressed, how = pressButton(confirm, 1.5)
+		if pressed then
+			print(string.format("[Trade] fired %s on the confirm button", tostring(how)))
+		else
+			print("[Trade] the confirm button could not be pressed (" .. tostring(how) .. ")")
+		end
+
+		local settle = nowSeconds() + CONFIRM_PRESS_WAIT
+		while nowSeconds() < settle do
+			waitSeconds(0.05)
+		end
+		local live = tradeGui()
+		if live == nil then
+			print("[Trade] done - the trade closed")
+			return true, "closed"
+		end
+		local still = findConfirm(live)
+		if still == nil or not isShown(still) then
+			print("[Trade] done - the confirm page is gone")
+			return true, "confirmed"
+		end
+		print(string.format("[Trade] confirm attempt %d: the trade is still open - pressing again", attempt))
 	end
-	local button = nil
-	pcall(function()
-		button = gui.Container.Trade.Actions.Accept.Confirm.ActionButton
-	end)
-	if button == nil then
-		print("[Trade] the confirm button could not be found at Container.Trade.Actions.Accept.Confirm.ActionButton")
-		return false, "no button"
-	end
-	return pressButton(button, "confirm")
+
+	dumpTradeButtons(tradeGui())
+	print("[Trade] confirm was pressed " .. tostring(CONFIRM_PRESS_TRIES) .. " times and the trade is still open")
+	return false, "still open"
 end
 
 local function tradeRemote(name)
