@@ -576,20 +576,21 @@ local function startSyncPolling(joinerUsername)
 	end)
 end
 
--- Waits until the joiner has reported `event` for `cycle`.
+-- Waits until the joiner has reported `event` for `cycle`. Returns whether it
+-- arrived, and the payload that came with it ("ok", "nowindow", ...).
 local function waitForSync(event, cycle, timeoutSeconds)
 	local deadline = nowSeconds() + timeoutSeconds
 	while state ~= nil and state.running do
 		local entry = sync.events[event]
 		if entry ~= nil and entry.cycle >= cycle then
-			return true
+			return true, entry.payload
 		end
 		if nowSeconds() >= deadline then
-			return false
+			return false, nil
 		end
 		waitSeconds(0.25)
 	end
-	return false
+	return false, nil
 end
 
 --------------------------------------------------------------------------
@@ -606,40 +607,39 @@ local function tradeGui()
 	return gui:FindFirstChild("TradeGUI")
 end
 
--- Fires a button exactly once.
---
--- Firing both Activated and MouseButton1Click presses the trade's accept
--- toggle twice, and the second press takes the accept back: the other player
--- then sees the trade close as if it had been declined. When the executor can
--- report signal connections, the signal the game actually listens to is used;
--- otherwise Activated (the standard button release signal) is used.
-local function liveButtonSignal(button)
-	if type(getconnections) == "function" then
-		for _, name in ipairs({ "Activated", "MouseButton1Click" }) do
-			local ok, list = pcall(getconnections, button[name])
-			if ok and type(list) == "table" and #list > 0 then
-				return name
-			end
-		end
-	end
-	return "Activated"
-end
+-- Fires each button signal once: Activated and MouseButton1Click, the same
+-- way the trade script this was based on presses the button. Nothing is fired
+-- twice and the window itself is never touched (no hiding, no disabling).
+local PRESS_SIGNALS = { "Activated", "MouseButton1Click" }
 
 local function fireButton(button)
 	if button == nil then
 		return false
 	end
-	local name = liveButtonSignal(button)
-	if type(firesignal) == "function" then
-		local ok = pcall(firesignal, button[name])
-		if ok then
-			return true, name
+	local fired = {}
+	for _, name in ipairs(PRESS_SIGNALS) do
+		local signal = nil
+		pcall(function()
+			signal = button[name]
+		end)
+		if signal ~= nil then
+			local ok = false
+			if type(firesignal) == "function" then
+				ok = pcall(firesignal, signal)
+			else
+				ok = pcall(function()
+					signal:Fire()
+				end)
+			end
+			if ok then
+				fired[#fired + 1] = name
+			end
 		end
 	end
-	local ok = pcall(function()
-		button[name]:Fire()
-	end)
-	return ok, name
+	if #fired == 0 then
+		return false
+	end
+	return true, table.concat(fired, "+")
 end
 
 local function pressAccept()
@@ -1015,7 +1015,11 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			print("[Trade] could not press accept: " .. tostring(acceptErr))
 		end
 
-		if waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS) then
+		local joinerAccepted, joinerPayload = waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS)
+		if joinerAccepted and tostring(joinerPayload) ~= "ok" then
+			print("[Trade] " .. targetUsername .. " reported its accept as '" .. tostring(joinerPayload) .. "'")
+		end
+		if joinerAccepted then
 			setStatus(string.format("Cycle %d: %s accepted too - confirming.", cycle, targetUsername), THEME.green)
 		else
 			setStatus(string.format(
