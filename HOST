@@ -114,6 +114,10 @@ local CONFIG = {
 	-- says why, instead of pretending to work.
 	MAX_EMPTY_CYCLES = 3,
 
+	-- After a confirm, how long the next request waits for this client's trade
+	-- window to disappear. The game refuses a new request while one is open.
+	TRADE_CLOSE_SECONDS = 4,
+
 	-- How many items go into one trade, and how many may be left behind when
 	-- the loop stops. With STOP_AT_REMAINING = 2 the last two items stay put.
 	MAX_ITEMS_PER_TRADE = 4,
@@ -500,8 +504,22 @@ local function decodeSync(text)
 	}
 end
 
+-- The relay can rate limit (ntfy's free relay allows only so many requests a
+-- minute). While it is down the fixed timings still drive the trade, so the
+-- waits for the joiner's word are shortened rather than stalling every cycle.
+local syncTrouble = 0
+
+local function noteSync(ok)
+	if ok then
+		syncTrouble = 0
+	else
+		syncTrouble = syncTrouble + 1
+	end
+end
+
 local function publishSync(event, joinerUsername, cycle, payload)
 	local ok, status = relayPublishTo(syncTopic, encodeSync(event, joinerUsername, cycle, payload))
+	noteSync(ok)
 	if not ok then
 		print("[Trade] could not publish '" .. tostring(event) .. "' (error " .. tostring(status) .. ")")
 	end
@@ -534,11 +552,13 @@ local function pollSync(myJob, joinerUsername)
 	sync.busy = false
 
 	if not ok then
+		noteSync(false)
 		if status == 429 then
 			waitSeconds(5)
 		end
 		return
 	end
+	noteSync(true)
 
 	local myPlace = tonumber(game.PlaceId) or 0
 	local wantedHost = tostring(localPlayer.Name or ""):lower()
@@ -579,6 +599,10 @@ end
 -- Waits until the joiner has reported `event` for `cycle`. Returns whether it
 -- arrived, and the payload that came with it ("ok", "nowindow", ...).
 local function waitForSync(event, cycle, timeoutSeconds)
+	-- With the relay silent, waiting the full time only delays the trade.
+	if syncTrouble >= 3 and timeoutSeconds > 3 then
+		timeoutSeconds = 3
+	end
 	local deadline = nowSeconds() + timeoutSeconds
 	while state ~= nil and state.running do
 		local entry = sync.events[event]
@@ -930,6 +954,20 @@ end
 -- How many of the items we just offered are still sitting in the salvage.
 -- A trade that really went through takes them out of it, so this is the honest
 -- answer to "did anything actually get traded?".
+-- The game refuses a new request while a trade window is still up, so the next
+-- request waits for this client's window to go away first. The cap keeps a game
+-- that leaves the window instance in place from stalling the loop.
+local function waitForTradeClosed(seconds)
+	local deadline = nowSeconds() + seconds
+	while state ~= nil and state.running and nowSeconds() < deadline do
+		if tradeGui() == nil then
+			return true
+		end
+		waitSeconds(0.25)
+	end
+	return tradeGui() == nil
+end
+
 local function countStillInQueue(batch, queue)
 	local present = {}
 	for _, name in ipairs(queue or {}) do
@@ -964,6 +1002,14 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		setStatus(string.format("Cycle %d: sending %s a trade request...", cycle, targetUsername), THEME.green)
 		updateInfo()
 
+		-- Every attempt starts with a clean slate: the verdict from the previous
+		-- attempt ("nowindow", a stale accept, ...) is never reused as if it
+		-- belonged to the request that is about to go out.
+		sync.events["reqok"] = nil
+		sync.events["items"] = nil
+		sync.events["accept"] = nil
+		sync.events["confirm"] = nil
+
 		local requested, requestError = requestTrade(targetPlayer, targetUsername, cycle)
 		if not requested then
 			if tostring(requestError) == "stopped" then
@@ -983,7 +1029,18 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		-- The joiner answers as soon as its own trade window is open, which is
 		-- the proof that the request landed. Without that proof the items were
 		-- offered into a trade that did not exist yet and nothing was added.
-		if waitForSync("reqok", cycle, CONFIG.REQUEST_ACK_SECONDS) then
+		local joinerReady, readyPayload = waitForSync("reqok", cycle, CONFIG.REQUEST_ACK_SECONDS)
+		if joinerReady and tostring(readyPayload) == "nowindow" then
+			-- Its window never opened, so there is nothing to put items into.
+			-- Send the same request again instead of trading into thin air.
+			print("[Trade] " .. targetUsername .. " says its trade window never opened - sending the request again")
+			setStatus(string.format(
+				"Cycle %d: %s's window did not open - asking again...",
+				cycle,
+				targetUsername
+			), THEME.amber)
+			return "retry"
+		elseif joinerReady then
 			print("[Trade] " .. targetUsername .. " has the trade window open")
 		else
 			print("[Trade] " .. targetUsername .. " has not confirmed the window yet - adding items anyway")
@@ -1033,7 +1090,10 @@ local function runTradeLoop(targetPlayer, targetUsername)
 
 		local joinerAccepted, joinerPayload = waitForSync("accept", cycle, CONFIG.ACK_WAIT_SECONDS)
 		if joinerAccepted and tostring(joinerPayload) ~= "ok" then
-			print("[Trade] " .. targetUsername .. " reported its accept as '" .. tostring(joinerPayload) .. "'")
+			-- The joiner had no window to accept in. Confirming here would close
+			-- a trade nobody agreed to, so hand the cycle back instead.
+			print("[Trade] " .. targetUsername .. " reported its accept as '" .. tostring(joinerPayload) .. "' - asking again instead of confirming")
+			return "retry"
 		end
 		if joinerAccepted then
 			setStatus(string.format("Cycle %d: %s accepted too - confirming.", cycle, targetUsername), THEME.green)
@@ -1054,6 +1114,8 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		end
 		waitForSync("confirm", cycle, CONFIG.ACK_WAIT_SECONDS)
 
+		-- The next request cannot go out while this window is still up.
+		waitForTradeClosed(CONFIG.TRADE_CLOSE_SECONDS)
 		waitSeconds(CONFIG.TRADE_SETTLE_SECONDS)
 
 		local after = getFreshWeaponQueue()
