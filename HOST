@@ -17,10 +17,13 @@ there is no handshake to wait for: whoever else is here is the target, and the
 	  5. It stops when nothing tradable is left. The Default Gun and Default
 	     Knife in Currents are never offered.
 
-	Both scripts need the same ROOM. CONFIG.RELAY_URL only has to be reachable
-	for the relay messages (who is who, and "finished"): every step above is
-	timed off the trade window and the clock, so a slow, rate-limited or dead
-	relay cannot delay or block a trade.
+	Both scripts need the same ROOM. The two clients meet on the same small relay
+	the ServerChat script uses, with the same logic: the channel name is worked
+	out from this server's JobId, so only clients in THIS server hear each other,
+	and the channel is read back through its /json?poll=1&since=<id> cursor, so
+	nothing old is replayed. That is what says CONNECTED on both sides. Every
+	step above is timed off the trade window and the clock, so a slow, busy or
+	dead relay cannot delay or block a trade.
 	Set CONFIG.TARGET to a username to trade with that person instead of whoever
 	else is in this server.
 ]]
@@ -36,9 +39,14 @@ local CONFIG = {
 	-- Message relay. ntfy.sh needs no signup.
 	RELAY_URL = "https://ntfy.sh",
 
-	-- Seconds between "the joiner is definitely in this server" and the first
-	-- trade request going out. This is the 5 second delay.
-	TRADE_START_DELAY_SECONDS = 5,
+	-- The trade starts as soon as the link says the other script is here (that
+	-- takes a fraction of a second). This is only a short settle on top of it.
+	TRADE_START_DELAY_SECONDS = 0.5,
+
+	-- If the relay never answers but the other person is standing in this
+	-- server, the trade still starts after this many seconds. Nothing about the
+	-- trade depends on the relay.
+	LINK_FALLBACK_SECONDS = 4,
 
 	-- The handshake, all in seconds:
 	--   request out --1s--> joiner accepts the request and says so
@@ -55,14 +63,16 @@ local CONFIG = {
 	NEXT_CYCLE_DELAY_SECONDS = 0.5,
 	ITEM_OFFER_GAP_SECONDS = 0.3,
 
-	-- How often the relay topic is read. The free relay refills about one request
-	-- every 5-10 seconds per network, and both clients share that budget, so a
-	-- slower read is what keeps it answering. Nothing below waits on it.
-	SYNC_POLL_SECONDS = 15,
-
-	-- How often each side says who it is on the relay. This is the only traffic
-	-- that runs when no trade is happening.
-	HELLO_SECONDS = 30,
+	-- The link: the same transport the ServerChat script uses. The channel name
+	-- comes from this server's JobId, so only clients in THIS server hear each
+	-- other. ntfy.sh allows 60 requests as a burst, then about one per 10s.
+	LINK_POLL_SECONDS = 10,        -- how often the channel is read
+	LINK_START_POLL_SECONDS = 1.5,   -- during the first moments: fast, so CONNECTED happens at once
+	LINK_START_POLL_WINDOW = 20,   -- how long that fast pace lasts
+	LINK_MAX_POLL_SECONDS = 25,    -- the most it backs off to while the relay refuses
+	LINK_HELLO_SECONDS = 12,       -- how often to say hello until the other script answers
+	LINK_HELLO_RETRY_SECONDS = 4,  -- a refused hello is retried this soon
+	LINK_KEEPALIVE_SECONDS = 60,   -- how often after that
 
 	-- The game refuses a new request while a trade is open and for a moment
 	-- after one, so a failed request is retried instead of ending the loop.
@@ -265,11 +275,28 @@ if not httpAvailable then
 end
 
 --------------------------------------------------------------------------
--- Room / wire format
+-- The link to the other side
+--
+-- This is the ServerChat transport, used exactly the way it is used there:
+--
+--   * Both clients work out the SAME channel name from this server's JobId
+--     (with ROOM as the salt). Two people in different servers therefore never
+--     see each other, and nothing left over from an older server is read.
+--   * A message is one line, its fields separated by \1:
+--       V1 | kind | clientId | username | displayName | cycle | event | payload | stamp
+--   * It is published with  POST <relay>/<channel>  and read back with
+--       GET <relay>/<channel>/json?poll=1&since=<last id seen>
+--     The cursor starts at "3m" (recent history) and afterwards only moves
+--     to ids that actually came back, so a read only ever returns what is new.
+--   * A line is believed only when its sender is a player standing in this
+--     server right now - the same check ServerChat makes - so somebody else
+--     using the relay is ignored.
+--
+-- The link says who the other side is (the username the request is addressed
+-- to), puts CONNECTED on both cards, and carries each step of the trade as a
+-- hint. No step waits for a message: the trade window and the clock run the
+-- cycle, so a slow, busy or dead relay costs a log line, not a trade.
 --------------------------------------------------------------------------
-
-local WIRE_VERSION = "v2"        -- what this script publishes
-local PRESENCE_VERSION = "j1"    -- what joiner.lua publishes
 
 local function sanitizeRoom(raw)
 	local cleaned = tostring(raw or ""):lower():gsub("[^%w_%-]", "")
@@ -283,24 +310,70 @@ local function sanitizeRoom(raw)
 end
 
 local room = sanitizeRoom(CONFIG.ROOM)
-local topic = "fbshare_" .. room
 local relayBase = tostring(CONFIG.RELAY_URL):gsub("/+$", "")
 
-local function relayPublishTo(topicName, text)
-	if httpRequest then
-		local ok, status, body = http(relayBase .. "/" .. topicName, "POST", text, {
-			["Content-Type"] = "text/plain",
-		})
-		return ok, status, body
+-- Filled in further down. The trade code runs before the UI is built, so it
+-- needs these names up front and assigns to them there.
+local ui, state, setStatus, updateInfo, THEME
+
+local SEP = string.char(1)
+
+-- A fresh id every run, like ServerChat's clientId.
+math.randomseed(os.time() + math.floor((os.clock and os.clock() or 0) * 1000000))
+local function randomId(length)
+	local pool = "abcdefghijklmnopqrstuvwxyz0123456789"
+	local out = {}
+	for i = 1, length do
+		local k = math.random(1, #pool)
+		out[i] = pool:sub(k, k)
 	end
-	-- GET publish, for the game:HttpGet-only fallback.
-	local ok, status, body = http(relayBase .. "/" .. topicName .. "/publish?message=" .. urlEncode(text), "GET")
-	return ok, status, body
+	return table.concat(out)
 end
 
-local function relayPublish(text)
-	return relayPublishTo(topic, text)
+local clientId = randomId(12)
+local myName = tostring(localPlayer.Name or "")
+local myDisplay = cleanText(tostring(localPlayer.DisplayName or myName), 40)
+
+local function hash32(text)
+	local h = 5381
+	for i = 1, #text do
+		h = (h * 33 + string.byte(text, i)) % 4294967296
+	end
+	return h
 end
+
+-- 32-bit hash printed as eight hex digits. Written out by hand so it works
+-- the same in every Lua (no %x needed).
+local function hex32(value)
+	local digits = "0123456789abcdef"
+	local out = {}
+	local n = math.floor(value or 0) % 4294967296
+	for i = 1, 8 do
+		local d = n % 16
+		out[9 - i] = digits:sub(d + 1, d + 1)
+		n = math.floor((n - d) / 16)
+	end
+	return table.concat(out)
+end
+
+local function buildChannel()
+	local jobId = ""
+	pcall(function()
+		jobId = tostring(game.JobId or "")
+	end)
+	if jobId == "" then
+		-- JobId is normally readable on the client; without it, the place alone
+		-- still gives a working channel.
+		jobId = "noplace" .. tostring(game.PlaceId)
+	end
+	local seed = tostring(room) .. "|" .. tostring(game.PlaceId) .. "|" .. jobId
+	return "rbxshare" .. hex32(hash32(seed)) .. hex32(hash32(seed .. "#2"))
+end
+
+local channel = buildChannel()
+local channelCode = channel:sub(-6):upper()
+local publishUrl = relayBase .. "/" .. channel
+local pollUrlBase = publishUrl .. "/json?poll=1&since="
 
 local function currentJobId()
 	local ok, job = pcall(function()
@@ -312,135 +385,217 @@ local function currentJobId()
 	return ""
 end
 
---------------------------------------------------------------------------
--- Talking to the joiner
---
--- This is the relay from the first script, used the same way: a line is
--- published to "fbshare_<room>" and the topic is read back with one GET on
--- /raw?poll=1&since=30m. What changed is only what it is for. Both people are
--- already in this server, so the username the trade request needs comes from
--- the Players list, and the trade window itself says when the other side
--- accepted. The relay confirms who is who (which matters with three or more
--- people in the server) and says when this side is finished. No step of the
--- trade waits on a message: a busy or unreachable relay costs a log line, not
--- a trade.
---
--- The free relay refills roughly one request every five to ten seconds PER
--- NETWORK, and both clients usually share one, so this side stays well under
--- it: one read every SYNC_POLL_SECONDS, one hello every HELLO_SECONDS, and the
--- per-cycle messages are dropped when they would land too close together.
-
-local SYNC_VERSION = "t1"
-
--- One GET, the same call the first script used to read its topic.
-local function relayReadTopic(topicName, minutes)
-	local url = relayBase .. "/" .. topicName .. "/raw?poll=1&since=" .. tostring(minutes) .. "m"
-	return http(url, "GET")
+local function relayPublish(text)
+	if httpRequest then
+		local ok, status = http(publishUrl, "POST", text, { ["Content-Type"] = "text/plain" })
+		return ok, status
+	end
+	-- GET publish, for the game:HttpGet-only fallback.
+	return http(relayBase .. "/" .. channel .. "/publish?message=" .. urlEncode(text), "GET")
 end
 
--- Filled in further down. The trade code is defined before the UI and the
--- state table, so it needs the names up front and assigns to them there.
-local ui, state, setStatus, updateInfo, THEME
+-- Split on \1 and keep empty fields: a payload may be empty.
+local function splitFields(raw)
+	local fields = {}
+	local start = 1
+	while true do
+		local found, last = string.find(raw, SEP, start, true)
+		if not found then
+			fields[#fields + 1] = string.sub(raw, start)
+			return fields
+		end
+		fields[#fields + 1] = string.sub(raw, start, found - 1)
+		start = last + 1
+	end
+end
 
--- t1|place|job|cycle|event|payload|from|to|stamp
-local function encodeSync(event, toUsername, cycle, payload)
+local function encodeMessage(kind, cycle, event, payload)
 	return table.concat({
-		SYNC_VERSION,
-		tostring(tonumber(game.PlaceId) or 0),
-		cleanText(currentJobId(), 100),
+		"V1",
+		cleanText(tostring(kind or ""), 8),
+		clientId,
+		cleanText(myName, 40),
+		myDisplay,
 		tostring(tonumber(cycle) or 0),
-		cleanText(tostring(event), 16),
+		cleanText(tostring(event or ""), 16),
 		cleanText(tostring(payload or ""), 60),
-		cleanText(tostring(localPlayer.Name or ""), 40),
-		cleanText(tostring(toUsername or ""), 40),
 		tostring(os.time()),
-	}, "|")
+	}, SEP)
 end
 
-local function decodeSync(text)
+local function decodeMessage(text)
 	if type(text) ~= "string" then
 		return nil
 	end
-	local parts = {}
-	for part in (text .. "|"):gmatch("([^|]*)|") do
-		parts[#parts + 1] = part
-	end
-	if #parts ~= 9 or parts[1] ~= SYNC_VERSION then
+	local parts = splitFields(text)
+	if #parts ~= 9 or parts[1] ~= "V1" then
 		return nil
 	end
-
-	local place = tonumber(parts[2])
-	local cycle = tonumber(parts[4])
+	local cycle = tonumber(parts[6])
 	local stamp = tonumber(parts[9])
-	if not place or place <= 0 or not cycle or not stamp then
+	if cycle == nil or stamp == nil then
 		return nil
 	end
-
 	return {
-		place = place,
-		job = cleanText(parts[3], 100),
+		kind = cleanText(parts[2], 8),
+		from = parts[3],
+		username = cleanText(parts[4], 40),
+		display = cleanText(parts[5], 40),
 		cycle = cycle,
-		event = cleanText(parts[5], 16),
-		payload = cleanText(parts[6], 60),
-		from = cleanText(parts[7], 40),
-		to = cleanText(parts[8], 40),
+		event = cleanText(parts[7], 16),
+		payload = cleanText(parts[8], 60),
 		stamp = stamp,
 	}
 end
 
-local sync = {
-	started = false,
-	polling = false,
-	events = {},
-	trouble = 0,
-	answered = false,
-	heard = false,
-	lastPublishAt = 0,
-	lastNoteAt = 0,
-}
-
--- What the card shows about the relay. "local" is not a failure: the trade is
--- driven by the trade window and the clock, and it runs the same either way.
-local function linkState()
-	if sync.heard then
-		return "relay + local"
-	elseif sync.answered then
-		return "local (relay silent)"
+-- The smallest JSON reader that is enough for ntfy's one-object-per-line
+-- replies (this is the same one ServerChat uses).
+local function jsonString(line, key)
+	local needle = '"' .. key .. '":"'
+	local start = line:find(needle, 1, true)
+	if not start then
+		return nil
 	end
-	return "local"
+	local i = start + #needle
+	local out = {}
+	while i <= #line do
+		local char = line:sub(i, i)
+		if char == "\\" then
+			local nextChar = line:sub(i + 1, i + 1)
+			if nextChar == "u" then
+				local code = tonumber(line:sub(i + 2, i + 5), 16)
+				if code and code <= 0x10FFFF and not (code >= 0xD800 and code <= 0xDFFF) then
+					out[#out + 1] = utf8.char(code)
+				else
+					out[#out + 1] = "?"
+				end
+				i = i + 6
+			elseif nextChar == "n" then
+				out[#out + 1] = "\n"
+				i = i + 2
+			elseif nextChar == "t" then
+				out[#out + 1] = "\t"
+				i = i + 2
+			elseif nextChar == "r" then
+				out[#out + 1] = "\r"
+				i = i + 2
+			else
+				out[#out + 1] = nextChar
+				i = i + 2
+			end
+		elseif char == '"' then
+			return table.concat(out)
+		else
+			out[#out + 1] = char
+			i = i + 1
+		end
+	end
+	return table.concat(out)
 end
 
-local MIN_PUBLISH_GAP = 4
+local link = {
+	started = false,
+	startedAt = 0,
+	polling = false,
+	connected = false,
+	connectedAt = 0,
+	peerUsername = "",
+	peerDisplay = "",
+	peerAckedAt = 0,
+	events = {},
+	cursor = "3m",
+	answered = false,
+	trouble = 0,
+	lastError = nil,
+	lastNoteAt = 0,
+	lastHelloAt = -1e9,  -- so the first hello goes out at once
+	lastHelloFailed = false,
+}
 
-local function publishSync(event, toUsername, cycle, payload)
-	local now = nowSeconds()
-	local urgent = event == "hello" or event == "done" or event == "req"
-	if not urgent and now - sync.lastPublishAt < MIN_PUBLISH_GAP then
+local function linkState()
+	if link.connected then
+		return "linked with " .. (link.peerDisplay ~= "" and link.peerDisplay or link.peerUsername)
+	elseif link.answered then
+		return "relay answering, waiting for the other script"
+	elseif link.trouble > 0 then
+		return "relay busy - trading on the clock"
+	end
+	return "relay starting"
+end
+
+-- ntfy.sh allows 60 requests as a burst, then about one per 10 seconds, for a
+-- whole network. Both clients share that, so polls are spaced out and the Polls are spaced out, and the optional per-step messages only go
+-- out when this bucket has a token, so several busy cycles cannot drain the
+-- allowance. The two that matter - the request and "finished" - always go out.
+local bucket = { tokens = 4, burst = 4, perToken = 12, at = nowSeconds() }
+
+local function takeToken()
+	local at = nowSeconds()
+	while bucket.tokens < bucket.burst and at - bucket.at >= bucket.perToken do
+		bucket.tokens = bucket.tokens + 1
+		bucket.at = bucket.at + bucket.perToken
+	end
+	if bucket.tokens <= 0 then
 		return false
 	end
-	sync.lastPublishAt = now
-	local ok, status = relayPublish(encodeSync(event, toUsername, cycle, payload))
-	if not ok and now - sync.lastNoteAt > 60 then
-		sync.lastNoteAt = now
-		print("[Trade] relay publish skipped (" .. tostring(status) .. ") - the trade does not wait on it")
+	bucket.tokens = bucket.tokens - 1
+	return true
+end
+
+local function publishMessage(kind, cycle, event, payload)
+	local forced = kind == "hello" or kind == "ack" or event == "req" or event == "done"
+	if not forced and not takeToken() then
+		return false
+	end
+	local ok, status = relayPublish(encodeMessage(kind, cycle, event, payload))
+	if not ok and nowSeconds() - link.lastNoteAt > 60 then
+		link.lastNoteAt = nowSeconds()
+		print("[Trade] the relay did not take a message (" .. tostring(status) .. ") - the trade keeps its own clock")
 	end
 	return ok
 end
 
-local function pollSync(myJob, otherUsername)
-	if sync.polling then
-		return
+-- The call sites below name who a message is for. The channel is already this
+-- server only, so the name is not needed on the wire - it stays in the log.
+local function publishSync(event, toUsername, cycle, payload)
+	return publishMessage("trade", cycle, event, payload)
+end
+
+local function notePeer(entry)
+	local first = not link.connected
+	link.peerUsername = entry.username
+	link.peerDisplay = entry.display ~= "" and entry.display or entry.username
+	if first then
+		link.connected = true
+		link.connectedAt = nowSeconds()
+		print(string.format(
+			"[Trade] CONNECTED to %s (@%s) over the link - both scripts are in this server",
+			link.peerDisplay,
+			link.peerUsername
+		))
+		if setStatus ~= nil and THEME ~= nil then
+			setStatus("CONNECTED to " .. link.peerDisplay .. " - starting the trade", THEME.green)
+		end
 	end
-	sync.polling = true
-	local ok, status, body = relayReadTopic(topic, 30)
-	sync.polling = false
+	return first
+end
+
+-- One read: only the messages that arrived after the last id we saw.
+local function pollLink()
+	if link.polling then
+		return false
+	end
+	link.polling = true
+	local ok, status, body = http(pollUrlBase .. link.cursor, "GET")
+	link.polling = false
 
 	if not ok then
-		sync.trouble = sync.trouble + 1
-		if nowSeconds() - sync.lastNoteAt > 60 then
-			sync.lastNoteAt = nowSeconds()
+		link.trouble = link.trouble + 1
+		link.lastError = status
+		if nowSeconds() - link.lastNoteAt > 60 then
+			link.lastNoteAt = nowSeconds()
 			if status == 429 then
-				print("[Trade] the relay is busy (429) - the trade keeps its own clock, nothing is blocked")
+				print("[Trade] the relay asked us to slow down - the trade keeps its own clock, nothing is blocked")
 			else
 				print("[Trade] relay read failed (" .. tostring(status) .. ") - the trade keeps its own clock")
 			end
@@ -448,32 +603,43 @@ local function pollSync(myJob, otherUsername)
 		return false
 	end
 
-	sync.trouble = 0
-	sync.answered = true
-
-	local myPlace = tonumber(game.PlaceId) or 0
-	local me = tostring(localPlayer.Name or ""):lower()
-	local other = tostring(otherUsername or ""):lower()
+	link.trouble = 0
+	link.lastError = nil
+	link.answered = true
 
 	for line in tostring(body):gmatch("[^\r\n]+") do
-		local entry = decodeSync(line)
-		if entry ~= nil
-			and entry.place == myPlace
-			and (myJob == "" or entry.job == "" or entry.job == myJob)
-			and entry.from:lower() ~= me
-			and (other == "" or entry.from:lower() == other)
-			and (entry.to == "" or entry.to:lower() == me)
-		then
-			if entry.event == "hello" then
-				if not sync.heard then
-					print("[Trade] the relay confirmed the other side: " .. entry.from .. " (" .. tostring(entry.payload) .. ")")
-				end
-				sync.heard = true
-			else
-				local current = sync.events[entry.event]
-				if current == nil or entry.cycle > current.cycle
-					or (entry.cycle == current.cycle and entry.stamp >= current.stamp) then
-					sync.events[entry.event] = entry
+		if jsonString(line, "event") == "message" then
+			local id = jsonString(line, "id")
+			if id ~= nil then
+				link.cursor = id
+			end
+			local payload = jsonString(line, "message")
+			if payload ~= nil then
+				local entry = decodeMessage(payload)
+				if entry ~= nil and entry.from ~= clientId and entry.username:lower() ~= myName:lower() then
+					-- ServerChat's rule: only somebody really standing in this server.
+					local here = nil
+					pcall(function()
+						here = Players:FindFirstChild(entry.username)
+					end)
+					if here ~= nil then
+						if entry.event == "hello" then
+							notePeer(entry)
+							local at = nowSeconds()
+							if at - link.peerAckedAt >= 20 then
+								link.peerAckedAt = at
+								publishMessage("ack", 0, "ack", "")
+							end
+						elseif entry.event == "ack" then
+							notePeer(entry)
+						elseif entry.event ~= "" then
+							local current = link.events[entry.event]
+							if current == nil or entry.cycle > current.cycle
+								or (entry.cycle == current.cycle and entry.stamp >= current.stamp) then
+								link.events[entry.event] = entry
+							end
+						end
+					end
 				end
 			end
 		end
@@ -481,26 +647,41 @@ local function pollSync(myJob, otherUsername)
 	return true
 end
 
--- One loop does both jobs: say hello now and then, and read the topic. The
--- pause doubles while the relay is refusing, so a rate limit is waited out
--- quietly instead of hammering the topic.
-local function startRelayLoop(otherUsername)
-	if sync.started then
+-- One loop does both jobs: say hello now and then, and read the channel. The
+-- pause grows while the relay is refusing, so a busy relay is waited out
+-- quietly instead of being hammered.
+local function startRelayLoop()
+	if link.started then
 		return
 	end
-	sync.started = true
-	local myJob = currentJobId()
+	link.started = true
+	link.startedAt = nowSeconds()
 	spawnThread(function()
-		local nextHelloAt = 0
 		while state ~= nil and state.running do
-			if nowSeconds() >= nextHelloAt then
-				publishSync("hello", otherUsername or "", 0, "host")
-				nextHelloAt = nowSeconds() + CONFIG.HELLO_SECONDS
+			local at = nowSeconds()
+			local gap = CONFIG.LINK_HELLO_SECONDS
+			if link.connected then
+				gap = CONFIG.LINK_KEEPALIVE_SECONDS
+			elseif link.lastHelloFailed then
+				-- A hello that was refused is retried quickly: it is the one
+				-- message the handshake needs.
+				gap = CONFIG.LINK_HELLO_RETRY_SECONDS
 			end
-			pollSync(myJob, otherUsername or "")
-			local pause = CONFIG.SYNC_POLL_SECONDS
-			if sync.trouble > 0 then
-				pause = math.min(60, pause * (1 + sync.trouble))
+			if at - link.lastHelloAt >= gap then
+				link.lastHelloAt = at
+				link.lastHelloFailed = not publishMessage("hello", 0, "hello", "host")
+			end
+			pollLink()
+			-- For the first seconds the channel is read every 1.5s, so two copies
+			-- started together say CONNECTED almost at once. After that the normal
+			-- pace applies: the relay allows 60 requests as a burst and then only
+			-- about one every 10 seconds.
+			local pause = CONFIG.LINK_POLL_SECONDS
+			if nowSeconds() - link.startedAt < CONFIG.LINK_START_POLL_WINDOW then
+				pause = CONFIG.LINK_START_POLL_SECONDS
+			end
+			if link.trouble > 0 then
+				pause = math.min(CONFIG.LINK_MAX_POLL_SECONDS, pause * (1 + link.trouble))
 			end
 			waitSeconds(pause)
 		end
@@ -1362,7 +1543,7 @@ local function runTradeLoop(targetPlayer, targetUsername)
 	local traded = 0
 	local emptyCycles = 0
 
-	startRelayLoop(targetUsername)
+	startRelayLoop()
 
 	-- One full round trip. "ok" means the items left the inventory, "retry"
 	-- means this trade did not happen at all, "stop" means the script is done.
@@ -1995,6 +2176,15 @@ local function resolveTarget()
 	if CONFIG.TARGET ~= nil and tostring(CONFIG.TARGET) ~= "" then
 		return findPlayerByUsername(tostring(CONFIG.TARGET))
 	end
+	-- Whoever the link heard from first, as long as they are really here (the
+	-- link only believes players standing in this server), then simply whoever
+	-- else is here.
+	if link.peerUsername ~= "" then
+		local linked = findPlayerByUsername(link.peerUsername)
+		if linked ~= nil then
+			return linked
+		end
+	end
 	return theOtherPlayer()
 end
 
@@ -2055,7 +2245,7 @@ end
 ui.stop.MouseButton1Click:Connect(function()
 	state.running = false
 	ui.gui:Destroy()
-	print("[Trade] stopped room '" .. room .. "'")
+	print("[Trade] stopped, channel " .. channelCode)
 end)
 
 ui.trade.MouseButton1Click:Connect(function()
@@ -2102,35 +2292,52 @@ end
 updateInfo()
 setStatus("Starting...", THEME.amber)
 
+-- The link runs from the first second, so CONNECTED can be said the moment
+-- the other script says hello - and the trade starts right then.
+startRelayLoop()
+
 spawnThread(function()
 	local announced = false
+	local otherSince = nil
 	while state.running and not state.tradeStarted do
+		local linked = link.connected and findPlayerByUsername(link.peerUsername) ~= nil
 		local target = resolveTarget()
+
 		if target ~= nil then
-			print("[Trade] CONNECTED to " .. target.Name .. " (same server) - first trade request in " .. tostring(CONFIG.TRADE_START_DELAY_SECONDS) .. "s")
-			setStatus(
-				"CONNECTED to " .. target.Name .. " - first trade request in " .. tostring(CONFIG.TRADE_START_DELAY_SECONDS) .. "s",
-				THEME.green
-			)
-			state.active = { username = target.Name }
-			updateInfo()
-			waitSeconds(CONFIG.TRADE_START_DELAY_SECONDS)
-			if state.running and not state.tradeStarted then
-				local again = resolveTarget()
-				if again ~= nil then
-					state.active = { username = again.Name }
-					runTrade(again, again.Name)
-				end
+			if otherSince == nil then
+				otherSince = nowSeconds()
 			end
-			return
+			-- The link's hello is the proof that both scripts are running. Without
+			-- it (relay busy, or the other side still loading) the trade starts
+			-- anyway: no step of it needs the relay.
+			if linked or nowSeconds() - otherSince >= CONFIG.LINK_FALLBACK_SECONDS then
+				if linked then
+					print("[Trade] CONNECTED to " .. target.Name .. " over the link - starting the trade now")
+				else
+					print("[Trade] CONNECTED to " .. target.Name .. " (same server, the relay has not answered) - starting the trade anyway")
+				end
+				setStatus("CONNECTED to " .. target.Name .. " - starting the trade", THEME.green)
+				state.active = { username = target.Name }
+				updateInfo()
+				waitSeconds(CONFIG.TRADE_START_DELAY_SECONDS)
+				if state.running and not state.tradeStarted then
+					local again = resolveTarget()
+					if again ~= nil then
+						state.active = { username = again.Name }
+						runTrade(again, again.Name)
+					end
+				end
+				return
+			end
+		else
+			otherSince = nil
+			if not announced then
+				announced = true
+				print("[Trade] waiting for the other person to be in this server (both scripts must be in the SAME server)")
+				setStatus("NOT CONNECTED - waiting for the other person. Both scripts must be in the SAME server.", THEME.amber)
+			end
 		end
 
-		if not announced then
-			announced = true
-			print("[Trade] waiting for the other person to be in this server (both scripts must be in the SAME server)")
-			setStatus("NOT CONNECTED - waiting for the other person. Both scripts must be in the SAME server.", THEME.amber)
-		end
-
-		waitSeconds(1)
+		waitSeconds(0.25)
 	end
 end)
