@@ -642,11 +642,26 @@ local function fireButton(button)
 	return true, table.concat(fired, "+")
 end
 
+-- If the game switched this client's trade window off, switch it back on.
+-- Nothing in either script ever switches it off.
+local function ensureTradeWindowShown(gui)
+	if gui == nil then
+		return
+	end
+	pcall(function()
+		if gui.Enabled ~= true then
+			gui.Enabled = true
+			print("[Trade] the trade window had been switched off (Enabled = false) - switched it back on")
+		end
+	end)
+end
+
 local function pressAccept()
 	local gui = tradeGui()
 	if gui == nil then
 		return false, "the trade window is not open"
 	end
+	ensureTradeWindowShown(gui)
 	local button = nil
 	pcall(function()
 		button = gui.Container.Trade.Actions.Accept.ActionButton
@@ -663,6 +678,7 @@ local function pressConfirm()
 	if gui == nil then
 		return false, "the trade window is not open"
 	end
+	ensureTradeWindowShown(gui)
 	local button = nil
 	pcall(function()
 		button = gui.Container.Trade.Actions.Accept.Confirm.ActionButton
