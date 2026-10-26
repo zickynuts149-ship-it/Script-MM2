@@ -1,19 +1,22 @@
 --[[
-	Trade - HOST	Run this in the Roblox server you want to trade in, with the other person
+	Trade - HOST
+	Run this in the Roblox server you want to trade in, with the other person
 	also in that server running joiner.lua. Nothing joins anybody: both of you
 	are already here.
 
 	The other side of the trade is simply the other player in this server, so
-there is no handshake to wait for: whoever else is here is the target, and the
-    request goes out 5s after they appear.
+	there is no handshake to wait for: whoever else is here is the target, and the
+	request goes out as soon as the link says the two scripts are in this server.
 
-	What happens, every cycle:
-	  1. The trade request goes out.
-	  2. This client's trade window opening IS the joiner having accepted; 2s
-	     later this side adds up to four weapons.
-	  3. 6s after the last item it presses accept (and checks the game took it),
-	     then confirms 1s later. The joiner presses 1s after this side.
-	  4. 0.5s after the window closes the next request goes out.
+	This side is in charge. Every cycle, the card names the step it is on:
+	  1. The trade request goes out and the joiner is told to accept it.
+	  2. It answers that it accepted - and only then do up to four weapons go in.
+	  3. The joiner is told the items are in; both sides count the same 6s from
+	     that, press accept, and confirm 1s after their own accept.
+	  4. It answers that it accepted the items too; 3s later the next request
+	     goes out. Nothing moves on a guess - if an answer never comes, the
+	     instruction is repeated, and only after the full wait does a silent
+	     link fall back to what the trade window shows.
 	  5. It stops when nothing tradable is left. The Default Gun and Default
 	     Knife in Currents are never offered.
 
@@ -48,20 +51,25 @@ local CONFIG = {
 	-- trade depends on the relay.
 	LINK_FALLBACK_SECONDS = 4,
 
-	-- The handshake, all in seconds:
-	--   request out --1s--> joiner accepts the request and says so
-	--   accepted    --REQUEST_SETTLE_SECONDS--> start adding items
-	--   last item   --ACCEPT_DELAY_SECONDS--> this side presses accept, and at
-	--                that same moment tells the joiner to press accept
-	--   told        --JOINER_ACCEPT_DELAY_SECONDS--> joiner presses accept
-	--   both accept --CONFIRM_DELAY_SECONDS--> confirm
-	--   confirmed   --NEXT_CYCLE_DELAY_SECONDS--> next request, no dead time
+	-- The handshake, all in seconds. This side is in charge: the joiner only
+	-- moves when it is told to, and every step waits for the reply that proves
+	-- the other side really did its part.
+	--   request out --(told: "accept it")--> joiner answers "reqok"
+	--   "reqok"     --REQUEST_SETTLE_SECONDS--> add the items (told: "items")
+	--   last item   --ACCEPT_DELAY_SECONDS--> both sides press accept
+	--   accepted    --CONFIRM_DELAY_SECONDS--> confirm
+	--   "acceptok"  --NEXT_CYCLE_DELAY_SECONDS--> next request
 	REQUEST_SETTLE_SECONDS = 2,
 	ACCEPT_DELAY_SECONDS = 6,
-	JOINER_ACCEPT_DELAY_SECONDS = 1,
 	CONFIRM_DELAY_SECONDS = 1,
-	NEXT_CYCLE_DELAY_SECONDS = 0.5,
+	NEXT_CYCLE_DELAY_SECONDS = 3,
 	ITEM_OFFER_GAP_SECONDS = 0.3,
+
+	-- How long one instruction may take to be answered, and how often it is
+	-- repeated while waiting. A reply is read on the joiner's next poll, and that
+	-- poll can be 10s away, so this has to be generous.
+	REPLY_WAIT_SECONDS = 25,
+	INSTRUCTION_RESEND_SECONDS = 6,
 
 	-- The link: the same transport the ServerChat script uses. The channel name
 	-- comes from this server's JobId, so only clients in THIS server hear each
@@ -79,8 +87,6 @@ local CONFIG = {
 	REQUEST_ATTEMPTS = 8,
 	REQUEST_RETRY_SECONDS = 1,
 
-	-- How long to wait for the joiner to accept before the request is resent.
-	REQUEST_ACK_SECONDS = 6,
 
 	-- Firing the accept signal is not proof the game took it, so the press is
 	-- checked and repeated until the window changes. These are the same values
@@ -134,9 +140,9 @@ local UserInputService = game:GetService("UserInputService")
 
 local localPlayer = Players.LocalPlayer
 
--- Printed at start-up so it is obvious which copy is running: v4 talks to the
--- joiner over the relay, but no trade step waits on it.
-local BUILD = "v4"
+-- Printed at start-up so it is obvious which copy is running: v5 is the
+-- host-led handshake, where every step waits for the joiner's answer.
+local BUILD = "v5"
 print("[Trade] host.lua " .. BUILD .. " for " .. tostring(localPlayer.DisplayName) .. " (@" .. tostring(localPlayer.Name) .. ")")
 
 local function waitSeconds(seconds)
@@ -505,6 +511,7 @@ local link = {
 	events = {},
 	cursor = "3m",
 	answered = false,
+	dropHistory = true,
 	trouble = 0,
 	lastError = nil,
 	lastNoteAt = 0,
@@ -543,7 +550,10 @@ local function takeToken()
 end
 
 local function publishMessage(kind, cycle, event, payload)
-	local forced = kind == "hello" or kind == "ack" or event == "req" or event == "done"
+	-- The instructions and the finish are what the handshake runs on, so they are
+	-- never held back by the local budget. Everything else can wait.
+	local forced = kind == "hello" or kind == "ack"
+		or event == "req" or event == "items" or event == "done"
 	if not forced and not takeToken() then
 		return false
 	end
@@ -607,41 +617,58 @@ local function pollLink()
 	link.lastError = nil
 	link.answered = true
 
+	-- The first read replays the last few minutes of this channel. Those messages
+	-- were published by an earlier run of these scripts - a trade that already
+	-- happened - so they are followed for their cursor and then thrown away.
+	-- Acting on them is exactly what used to make a first trade run as if it were
+	-- the second one.
+	local dropped = 0
+
 	for line in tostring(body):gmatch("[^\r\n]+") do
 		if jsonString(line, "event") == "message" then
 			local id = jsonString(line, "id")
 			if id ~= nil then
 				link.cursor = id
 			end
-			local payload = jsonString(line, "message")
-			if payload ~= nil then
-				local entry = decodeMessage(payload)
-				if entry ~= nil and entry.from ~= clientId and entry.username:lower() ~= myName:lower() then
-					-- ServerChat's rule: only somebody really standing in this server.
-					local here = nil
-					pcall(function()
-						here = Players:FindFirstChild(entry.username)
-					end)
-					if here ~= nil then
-						if entry.event == "hello" then
-							notePeer(entry)
-							local at = nowSeconds()
-							if at - link.peerAckedAt >= 20 then
-								link.peerAckedAt = at
-								publishMessage("ack", 0, "ack", "")
-							end
-						elseif entry.event == "ack" then
-							notePeer(entry)
-						elseif entry.event ~= "" then
-							local current = link.events[entry.event]
-							if current == nil or entry.cycle > current.cycle
-								or (entry.cycle == current.cycle and entry.stamp >= current.stamp) then
-								link.events[entry.event] = entry
+			if link.dropHistory then
+				dropped = dropped + 1
+			else
+				local payload = jsonString(line, "message")
+				if payload ~= nil then
+					local entry = decodeMessage(payload)
+					if entry ~= nil and entry.from ~= clientId and entry.username:lower() ~= myName:lower() then
+						-- ServerChat's rule: only somebody really standing in this server.
+						local here = nil
+						pcall(function()
+							here = Players:FindFirstChild(entry.username)
+						end)
+						if here ~= nil then
+							if entry.event == "hello" then
+								notePeer(entry)
+								local at = nowSeconds()
+								if at - link.peerAckedAt >= 20 then
+									link.peerAckedAt = at
+									publishMessage("ack", 0, "ack", "")
+								end
+							elseif entry.event == "ack" then
+								notePeer(entry)
+							elseif entry.event ~= "" then
+								local current = link.events[entry.event]
+								if current == nil or entry.cycle > current.cycle
+									or (entry.cycle == current.cycle and entry.stamp >= current.stamp) then
+									link.events[entry.event] = entry
+								end
 							end
 						end
 					end
 				end
 			end
+		end
+	end
+	if link.dropHistory then
+		link.dropHistory = false
+		if dropped > 0 then
+			print(string.format("[Trade] ignored %d old message(s) from a previous run on this channel", dropped))
 		end
 	end
 	return true
@@ -1619,11 +1646,12 @@ end
 --------------------------------------------------------------------------
 -- The coordinated trade loop
 --
---   request out (+ tell the joiner) -> 1s -> joiner accepts (+ tells the host)
---   -> 2s -> add up to 4 items -> 6s -> this side presses accept and tells the
---   joiner to press too, 1s later -> both accept -> 1s -> confirm -> 0.5s ->
---   next request. No dead time between cycles, until nothing tradable is left
---   (the Default Gun and Default Knife in Currents are never offered).
+--   request out (and told to the joiner) -> 1s -> joiner accepts (and says so)
+--   -> 2s -> add up to 4 items (and told to the joiner) -> 6s -> this side
+--   presses accept and says "accepting now", the joiner presses 1s later ->
+--   both confirm 1s after their own accept -> 3s -> next request. It repeats
+--   until nothing tradable is left (the Default Gun and Default Knife in
+--   Currents are never offered).
 --------------------------------------------------------------------------
 
 -- Asks for a trade and keeps trying while the game refuses. A request is
@@ -1646,6 +1674,11 @@ local function requestTrade(targetPlayer, targetUsername, cycle)
 			publishSync("req", targetUsername, cycle, tostring(attempt))
 			print(string.format("[Trade] request sent to %s (attempt %d)", targetUsername, attempt))
 			print("[Trade] told " .. targetUsername .. ": the request is out - accept it now")
+			setStatus(string.format(
+				"Cycle %d: request sent to %s - told it to accept",
+				cycle,
+				targetUsername
+			), THEME.green)
 			return true
 		end
 
@@ -1693,6 +1726,27 @@ local function countStillInQueue(batch, queue)
 	return left
 end
 
+-- Waits for one fresh reply from the joiner. "Fresh" is what makes the
+-- handshake safe: the entry has to be a message that was not already sitting in
+-- the link when the instruction went out, and it has to carry THIS cycle's
+-- number, so an answer meant for an earlier request can never unlock this one.
+local function waitForReply(event, cycle, before, seconds, resend)
+	local deadline = nowSeconds() + seconds
+	local nextResend = nowSeconds() + CONFIG.INSTRUCTION_RESEND_SECONDS
+	while state ~= nil and state.running and nowSeconds() < deadline do
+		local entry = link.events[event]
+		if entry ~= nil and entry ~= before and entry.cycle == cycle then
+			return entry
+		end
+		if resend ~= nil and nowSeconds() >= nextResend then
+			nextResend = nowSeconds() + CONFIG.INSTRUCTION_RESEND_SECONDS
+			resend()
+		end
+		waitSeconds(0.2)
+	end
+	return nil
+end
+
 local function runTradeLoop(targetPlayer, targetUsername)
 	if resolveTradePaths() == nil then
 		error("the inventory and salvage containers could not be found")
@@ -1709,6 +1763,12 @@ local function runTradeLoop(targetPlayer, targetUsername)
 	local function runCycle(batch)
 		setStatus(string.format("Cycle %d: sending %s a trade request...", cycle, targetUsername), THEME.green)
 		updateInfo()
+
+		-- The acceptance this cycle needs must be NEW: the previous cycle's
+		-- "reqok" is still sitting in the link and would otherwise read as an
+		-- acceptance of a request that has not gone out yet.
+		local reqokBefore = link.events["reqok"]
+		local acceptokBefore = link.events["acceptok"]
 
 		-- A window left over from the previous cycle would look like "the joiner
 		-- accepted" the moment the request goes out, so let it go first.
@@ -1732,32 +1792,55 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		-- not from a refused attempt before it.
 		local cycleStartedAt = nowSeconds()
 
-		-- The window opening HERE is the joiner having accepted: the server only
-		-- opens the trade for a request that was accepted. Both clients can see
-		-- that for themselves, so adding the items starts on this fact and not on
-		-- a message that might not arrive.
+		-- Step 2: the joiner saying it accepted. Nothing goes into this trade
+		-- before that answer arrives - that is what stops this side from adding
+		-- items into a request nobody accepted, and from treating the first trade
+		-- as if it were already the next one. The trade window opening here is
+		-- the same proof, but it is only believed once the whole wait is over, so
+		-- a window left over from an earlier attempt cannot shortcut it.
+		setStatus(
+			string.format("Cycle %d: request sent - waiting for %s to accept it", cycle, targetUsername),
+			THEME.amber
+		)
+		local reply = waitForReply("reqok", cycle, reqokBefore, CONFIG.REPLY_WAIT_SECONDS, function()
+			publishSync("req", targetUsername, cycle, "again")
+			print("[Trade] no answer yet - telling " .. targetUsername .. " again that the request is out")
+		end)
+		if not state.running then
+			return "stop"
+		end
+
 		local acceptedAt = nil
-		local deadline = nowSeconds() + CONFIG.REQUEST_ACK_SECONDS
-		while state.running and nowSeconds() < deadline do
-			if tradeGui() ~= nil then
-				acceptedAt = nowSeconds()
-				print(string.format("[Trade] %s accepted - the trade window is open", targetUsername))
-				break
-			end
-			waitSeconds(0.2)
+		local acceptedBy = nil
+		if reply ~= nil and tostring(reply.payload) ~= "nowindow" then
+			acceptedAt = nowSeconds()
+			acceptedBy = targetUsername .. " said it accepted"
+			print("[Trade] " .. targetUsername .. " says the request was accepted - adding the items")
+		elseif reply ~= nil then
+			print("[Trade] " .. targetUsername .. " could not open the trade window - sending the request again")
+			setStatus(
+				string.format("Cycle %d: %s could not open the trade - asking again...", cycle, targetUsername),
+				THEME.amber
+			)
+			return "retry"
+		elseif tradeGui() ~= nil then
+			acceptedAt = nowSeconds()
+			acceptedBy = "its trade window is open here, with no answer on the link"
+			print("[Trade] no answer from " .. targetUsername .. ", but the trade window is open - going on")
 		end
 
 		if acceptedAt == nil then
-			print("[Trade] the trade window never opened after the request - sending the request again")
+			print("[Trade] " .. targetUsername .. " never accepted the request - sending it again")
 			setStatus(
-				string.format("Cycle %d: the trade window did not open - asking %s again...", cycle, targetUsername),
+				string.format("Cycle %d: %s did not accept - asking again...", cycle, targetUsername),
 				THEME.amber
 			)
 			return "retry"
 		end
 		print(string.format(
-			"[Trade] request -> accepted in %.1fs; adding the items in %ss",
+			"[Trade] request -> accepted in %.1fs (%s); adding the items in %ss",
 			acceptedAt - cycleStartedAt,
+			tostring(acceptedBy),
 			tostring(CONFIG.REQUEST_SETTLE_SECONDS)
 		))
 		if not state.running then
@@ -1766,6 +1849,13 @@ local function runTradeLoop(targetPlayer, targetUsername)
 
 		-- The joiner accepted, so the window is live on both clients. The items go
 		-- in REQUEST_SETTLE_SECONDS after that, not after the request itself.
+		setStatus(string.format(
+			"Cycle %d: %s accepted - adding %d item(s) in %ds",
+			cycle,
+			targetUsername,
+			#batch,
+			math.ceil(CONFIG.REQUEST_SETTLE_SECONDS)
+		), THEME.green)
 		waitSeconds(CONFIG.REQUEST_SETTLE_SECONDS)
 
 		setStatus(string.format("Cycle %d: adding %d item(s)...", cycle, #batch), THEME.green)
@@ -1782,12 +1872,17 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		-- Told, never waited on: it is the joiner's backup clock for the case
 		-- where its own window does not show the items.
 		publishSync("items", targetUsername, cycle, tostring(#batch))
-		print(string.format(
-			"[Trade] all %d item(s) added - this side accepts in %ss, then %s accepts %ss later",
+		setStatus(string.format(
+			"Cycle %d: %d item(s) added - both sides accept in %ds",
+			cycle,
 			#batch,
-			tostring(CONFIG.ACCEPT_DELAY_SECONDS),
+			math.ceil(CONFIG.ACCEPT_DELAY_SECONDS)
+		), THEME.green)
+		print(string.format(
+			"[Trade] all %d item(s) added and %s told - both sides accept in %ss",
+			#batch,
 			targetUsername,
-			tostring(CONFIG.JOINER_ACCEPT_DELAY_SECONDS)
+			tostring(CONFIG.ACCEPT_DELAY_SECONDS)
 		))
 
 		local acceptAt = lastItemAt + CONFIG.ACCEPT_DELAY_SECONDS
@@ -1803,20 +1898,21 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			return "stop"
 		end
 
-		-- Told as it happens, so the console on both sides shows the same order.
-		publishSync("acceptgo", targetUsername, cycle, "now")
-		print("[Trade] told " .. targetUsername .. ": accepting now - press accept in " .. tostring(CONFIG.JOINER_ACCEPT_DELAY_SECONDS) .. "s")
+		setStatus(string.format("Cycle %d: pressing accept now...", cycle), THEME.green)
 
 		local accepted, acceptErr = pressAccept()
 		if not accepted then
 			-- This side never reached the accepted state, so there is nothing to
 			-- confirm. Handing the cycle back is what stops a half-agreed trade.
 			print("[Trade] this side did not accept the items (" .. tostring(acceptErr) .. ") - not confirming")
-			publishSync("hostaccept", targetUsername, cycle, "notaccepted")
 			return "retry"
 		end
-		publishSync("hostaccept", targetUsername, cycle, "ok")
 		print("[Trade] this side accepted the items")
+		setStatus(string.format(
+			"Cycle %d: this side accepted - confirming in %ds",
+			cycle,
+			math.ceil(CONFIG.CONFIRM_DELAY_SECONDS)
+		), THEME.green)
 
 		-- The joiner was told the same moment and presses accept one second after
 		-- this side, then confirms a second after that. Confirming on the clock
@@ -1828,9 +1924,41 @@ local function runTradeLoop(targetPlayer, targetUsername)
 		if not confirmed then
 			print("[Trade] could not press confirm: " .. tostring(confirmErr))
 		end
+		setStatus(string.format("Cycle %d: confirmed - waiting for the trade to close", cycle), THEME.green)
 
 		-- If the window is still up a few seconds later, the joiner's own confirm
 		-- had not landed yet: press once more rather than leaving it hanging.
+		-- Step 6: the joiner confirming too is what ends the cycle. Until it says
+		-- so, the next request does not go out. This is asked for first, so the
+		-- pause that follows the answer is the one that starts the next trade.
+		setStatus(
+			string.format("Cycle %d: waiting for %s to confirm it accepted too", cycle, targetUsername),
+			THEME.green
+		)
+		local ack = waitForReply("acceptok", cycle, acceptokBefore, CONFIG.REPLY_WAIT_SECONDS, function()
+			publishSync("items", targetUsername, cycle, tostring(#batch))
+			print("[Trade] no answer from " .. targetUsername .. " yet - repeating that the items are in")
+		end)
+		if not state.running then
+			return "stop"
+		end
+		local ackAt = nowSeconds()
+		if ack ~= nil then
+			local said = tostring(ack.payload)
+			if said ~= "ok" then
+				print("[Trade] " .. targetUsername .. " did not accept the items (" .. said .. ") - not moving on")
+				return "retry"
+			end
+			print("[Trade] " .. targetUsername .. " accepted the items too")
+		elseif tradeGui() ~= nil then
+			print("[Trade] " .. targetUsername .. " never confirmed and the trade is still open - starting over")
+			return "retry"
+		else
+			print("[Trade] no answer from " .. targetUsername .. ", but the trade closed - treating it as done")
+		end
+
+		-- If the window is still up even after both said yes, press confirm once
+		-- more rather than leaving it hanging.
 		local recheck = nowSeconds() + 4
 		while state.running and nowSeconds() < recheck and tradeGui() ~= nil do
 			waitSeconds(0.25)
@@ -1869,6 +1997,18 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			moved,
 			traded
 		))
+		-- The 3 second pause the joiner's answer bought: it is counted from that
+		-- answer, not from the end of all the bookkeeping above.
+		local pause = ackAt + CONFIG.NEXT_CYCLE_DELAY_SECONDS - nowSeconds()
+		setStatus(string.format(
+			"Cycle %d complete: %d traded. Next trade in %ds...",
+			cycle,
+			moved,
+			math.max(1, math.ceil(pause))
+		), THEME.green)
+		if pause > 0 then
+			waitSeconds(pause)
+		end
 		return "ok"
 	end
 
@@ -1951,7 +2091,7 @@ local function runTradeLoop(targetPlayer, targetUsername)
 			-- A trade that just closed needs a moment before the next request.
 			waitSeconds(CONFIG.NEXT_CYCLE_DELAY_SECONDS)
 		else
-			waitSeconds(CONFIG.NEXT_CYCLE_DELAY_SECONDS)
+			-- runCycle already waited out the pause counted from the joiner's answer.
 		end
 	end
 
